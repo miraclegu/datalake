@@ -36,7 +36,19 @@ IDX = "read_parquet('%s/raw/tdx/kline/index_*.parquet')" % ROOT
 BENCH = 'sh000300'
 WINDOWS = (60, 120, 252)
 MIN_OBS = {60: 40, 120: 80, 252: 120}
-START = '2013-01-01'          # 提前 3 年起算，保证 2016 年就有满窗口的 252 日 beta
+# ★ 起点由【基准指数的数据起点】决定，不是随便设的：
+#   sh000300 覆盖 2005-01-04 ~ 今（基日 2004-12-31，发布前可回溯计算）。
+#   配 MIN_OBS[252]=120，最早可用的 beta_252 落在 2005 年年中。
+#
+#   曾错设为 2013-01-01（当时只为对标 JQ 的 2016 起回测，往前留 3 年缓冲）。
+#   后果：红利低波把 beta_daily 做【内连接】，2005-2012 匹配不到行
+#   -> 候选池被清空 -> 连续 8 年空仓，而回测照常出报告、
+#   年化 10.85% 看着完全合理。占 38% 的时间空仓却毫无提示 ——
+#   这是本项目又一次「静默失败」。
+#   不要为了某个具体对标区间设这个常量，它应当由数据可得性决定。
+#   想再往前只能换基准（上证综指有 2003 起），但那会让 beta 语义
+#   中途改变、跳期不可比 —— 不做。
+START = '2005-01-01'
 
 
 def main():
@@ -51,6 +63,12 @@ def main():
     con.execute("""CREATE TEMP TABLE stk AS
         SELECT jq_code AS code, date, ret_1d AS sret FROM %s
         WHERE date >= DATE '%s' AND ret_1d IS NOT NULL""" % (PANEL, START))
+
+    n_s = con.execute('SELECT count(*) FROM stk').fetchone()[0]
+    d0 = con.execute('SELECT min(date) FROM stk').fetchone()[0]
+    print('个股样本: %s 行, 起点 %s' % (format(n_s, ','), d0))
+    assert str(d0)[:4] <= '2005', \
+        '个股样本起点 %s 晚于 2005 —— 面板或 START 被改窄' % d0
 
     cols = []
     for w in WINDOWS:
