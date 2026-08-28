@@ -267,6 +267,63 @@ def prepare(con):
     ) WHERE report_date = _max_rd
     """ % os.path.join(ROOT, 'std', 'fin_indicator_q.parquet'))
 
+    con.execute("""
+    CREATE OR REPLACE TEMP VIEW _shr AS
+    -- ★★ 流通股本的【双键 as-of】：可见性看 pub_date，有效性看 change_date。
+    --   缺一个键就错：tdx 的 floatmv 等价于只看 change_date，于是在 2015-12-31
+    --   就用上了 2016-03-31 才披露的年报口径 —— 这是 look-ahead，不是数据错。
+    --   实证 300317.XSHE：
+    --     change_date 2015-10-16 转增     pub_date 2015-10-10  流通 16744.3595万
+    --     change_date 2015-12-31 定期报告 pub_date 2016-03-31  流通  9317.7268万
+    --   2015-12-31 决策时市场只能知道 16744.3595万（×24.64 = 41.26亿），
+    --   聚宽开了 avoid_future_data 给的正是 41.258亿；tdx 给 9317.7268万（-44%）。
+    --   小市值策略按流通市值【升序】取最小 N 只，被低估的票被系统性推到前面，
+    --   是选择性偏差而非随机噪声 —— 所以这一项必须 PIT 正确。
+    --
+    --   定增【不】立刻增加流通股本，share_change 已严格建模锁定期：
+    --     增发新股上市 → 只增 share_total，新股全额进 share_limited
+    --     限售股份上市 / 激励股份解禁 → share_total 不变，share_trade_total 才增
+    --   恒等式 share_total = share_trade_total + share_limited 每行自洽。
+    --
+    --   arg_max 取「已可见行中 change_date 最大者」；排序键带 pub_date 破平局，
+    --   保证同一 change_date 的后续修订版本只在其 pub_date 之后才生效。
+    SELECT code, pub_date, float_sh, total_sh FROM (
+      SELECT code, pub_date,
+             arg_max(fs, ord) OVER win AS float_sh,
+             arg_max(ts, ord) OVER win AS total_sh,
+             row_number() OVER (PARTITION BY code, pub_date
+                 ORDER BY change_date DESC) AS _rn
+      FROM (
+        SELECT code, change_date, pub_date,
+               -- ★ 流通【A股】= share_trade_total - B股 - H股。
+               --   share_trade_total 是「全部无限售流通股」，含 B/H。
+               --   聚宽 circulating_market_cap 只算 A 股，实测四例精确吻合：
+               --     600054 黄山旅游 含B 64.602亿 / 扣B 27.770亿 = JQ 27.770亿
+               --     000756 新华制药 含H 61.326亿 / 扣H 41.211亿 = JQ 41.211亿
+               --     002705/300317 无B/H，扣不扣都等于 JQ
+               --   321 个代码有 B/H 股，其中 15.99% 的行 B/H 字段为 NULL ——
+               --   必须【前向结转】，直接 COALESCE(...,0) 会把这些行的流通股
+               --   算大一倍多。只前向不后向：B股发行之前确实没有 B 股，
+               --   后向填充会把未来才存在的 B 股倒推到发行前（look-ahead）。
+               greatest(share_trade_total - bf_b - bf_h, 0) * 1e4 AS fs,
+               share_total * 1e4 AS ts,
+               {'c': change_date, 'p': pub_date} AS ord
+        FROM (
+          SELECT *,
+                 COALESCE(share_b, last_value(share_b IGNORE NULLS) OVER w, 0) AS bf_b,
+                 COALESCE(share_h, last_value(share_h IGNORE NULLS) OVER w, 0) AS bf_h
+          FROM read_parquet('{shr}')
+          WHERE share_trade_total IS NOT NULL AND share_trade_total > 0
+            AND pub_date IS NOT NULL
+          WINDOW w AS (PARTITION BY code ORDER BY change_date, pub_date
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+        )
+      )
+      WINDOW win AS (PARTITION BY code ORDER BY pub_date
+          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+    ) WHERE _rn = 1
+    """.replace('{shr}', os.path.join(ROOT, 'std', 'share_change.parquet')))
+
     # ASOF 专用右表：键必须唯一，否则整个面板构建不确定（实测跨度 1.8pp）。
     # 只在这里去重 —— 推导链（np_ttm 需要上年年报）用的是完整的 _fin3。
     # 同日多期取【最新那期】，这对 as-of「当日已知的最新财报」正是想要的语义。
@@ -360,7 +417,13 @@ def build_year(con, y):
         --   每次调仓挤掉一只真票，使选股命中率从 94.9% 掉到 66.2%。
         --   置 NULL 让它被比较运算自然剔除，而不是伪装成"最小市值"。
         --   根治要等 P1-b 采 valuation.circulating_market_cap。
-        nullif(b.floatmv, 0) AS floatmv, nullif(b.totalmv, 0) AS totalmv,
+        -- ★ floatmv 优先用 share_change 重建（见 prepare 里 _shr 的实证），
+        --   取不到时回落到 tdx 值并置 0 为 NULL（0 是缺失伪装成极值：
+        --   300114.XSHE 有真实价量却 floatmv=0，按市值升序会永远排第一，
+        --   实测它从 2016 起 2056 个交易日霸占 v0b 候选池首位）。
+        COALESCE(sh.float_sh * c.close_bfq, nullif(b.floatmv, 0)) AS floatmv,
+        nullif(b.floatmv, 0) AS floatmv_tdx,   -- 原值留痕，便于审计
+        nullif(b.totalmv, 0) AS totalmv,
         -- 财务（as-of，可审计）
         f.report_date AS fin_report_date, f.pub_date AS fin_pub_date,
         f.revenue, f.net_profit_parent, f.eps_basic,
@@ -423,6 +486,9 @@ def build_year(con, y):
         {idx}
     FROM cur c
     LEFT JOIN basic_daily b ON b.symbol=c.symbol AND b.date=c.date
+    -- 流通股本（双键 as-of：可见性 pub_date + 有效性 change_date）
+    --   条件必须是 pub_date，用 change_date 会引入 look-ahead（见 _shr 注释）
+    ASOF LEFT JOIN _shr    sh ON sh.code=c.jq_code AND sh.pub_date <= c.date
     ASOF LEFT JOIN _fin3_asof f ON f.code=c.jq_code AND f.pub_date  <= c.date
     -- 聚宽权威单季指标（eps/roe/扣非），按公告日 as-of，与 _fin3 同样是 PIT
     ASOF LEFT JOIN _ind    ai ON ai.code=c.jq_code AND ai.pub_date <= c.date
@@ -531,6 +597,52 @@ def verify(con):
     check(bad == 0, 'fin_pub_date <= date（无未来财务） (违反 %d)' % bad)
 
     # 4) 关键列空值率
+    # ★★ 流通股本必须与股份变动表的【PIT】值一致 —— 这条错误靠对标 JQ 才发现，
+    #   代价是 FROEC 长期 +4.44pp 的残差归因不掉。现在在构建时就拦。
+    #   基准必须用双键 as-of（pub_date 可见 + change_date 生效）；用 change_date
+    #   做基准等于拿 look-ahead 校验 look-ahead，会双双"通过"。
+    #   总股本是对照组：它本来就 99.95% 吻合，若它一起掉说明 join 口径写错了。
+    r = con.execute("""
+        WITH pit AS (
+          SELECT code, pub_date, float_sh, total_sh FROM (
+            SELECT code, pub_date,
+                   arg_max(fs, ord) OVER win AS float_sh,
+                   arg_max(ts, ord) OVER win AS total_sh,
+                   row_number() OVER (PARTITION BY code, pub_date
+                       ORDER BY change_date DESC) AS _rn
+            FROM (SELECT code, change_date, pub_date,
+                         greatest(share_trade_total - bf_b - bf_h, 0)*1e4 AS fs,
+                         share_total*1e4 AS ts,
+                         {'c': change_date, 'p': pub_date} AS ord
+                  FROM (SELECT *,
+                          COALESCE(share_b, last_value(share_b IGNORE NULLS) OVER w, 0) bf_b,
+                          COALESCE(share_h, last_value(share_h IGNORE NULLS) OVER w, 0) bf_h
+                        FROM read_parquet('%s')
+                        WHERE share_trade_total > 0 AND pub_date IS NOT NULL
+                        WINDOW w AS (PARTITION BY code ORDER BY change_date, pub_date
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)))
+            WINDOW win AS (PARTITION BY code ORDER BY pub_date
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+          ) WHERE _rn = 1
+        ), pn AS (
+          SELECT jq_code AS code, date,
+                 floatmv/nullif(close_bfq,0) AS mfs,
+                 totalmv/nullif(close_bfq,0) AS mts
+          FROM %s
+          WHERE close_bfq > 0 AND floatmv > 0 AND date >= DATE '2016-01-01'
+        )
+        SELECT round(100.0*sum(CASE WHEN abs(pn.mfs/k.float_sh-1)<0.01
+                                    THEN 1 ELSE 0 END)/count(*), 2),
+               round(100.0*sum(CASE WHEN pn.mfs < k.float_sh*0.9
+                                    THEN 1 ELSE 0 END)/count(*), 2),
+               round(100.0*sum(CASE WHEN pn.mts IS NULL OR abs(pn.mts/k.total_sh-1)<0.01
+                                    THEN 1 ELSE 0 END)/count(*), 2)
+        FROM pn ASOF JOIN pit k ON k.code=pn.code AND k.pub_date<=pn.date
+    """ % (os.path.join(ROOT, 'std', 'share_change.parquet'), P)).fetchone()
+    check(r[0] >= 99.0, '流通股本与股份变动表 PIT 值吻合 %.2f%% >= 99%%' % r[0])
+    check(r[1] <= 0.5, '流通股本被低估>10%% 仅 %.2f%%（单向偏差，小市值按升序选股）' % r[1])
+    check(r[2] >= 99.0, '总股本吻合 %.2f%% >= 99%%（对照组）' % r[2])
+
     for col, lim in (('close_hfq', 0.001), ('floatmv', 0.02), ('sw_l1_name', 0.05)):
         r = con.execute('SELECT avg(CASE WHEN %s IS NULL THEN 1.0 ELSE 0 END) FROM %s'
                         % (col, P)).fetchone()[0]
