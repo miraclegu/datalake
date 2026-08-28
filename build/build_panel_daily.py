@@ -309,14 +309,34 @@ def prepare(con):
                share_total * 1e4 AS ts,
                {'c': change_date, 'p': pub_date} AS ord
         FROM (
-          SELECT *,
-                 COALESCE(share_b, last_value(share_b IGNORE NULLS) OVER w, 0) AS bf_b,
-                 COALESCE(share_h, last_value(share_h IGNORE NULLS) OVER w, 0) AS bf_h
-          FROM read_parquet('{shr}')
-          WHERE share_trade_total IS NOT NULL AND share_trade_total > 0
-            AND pub_date IS NOT NULL
-          WINDOW w AS (PARTITION BY code ORDER BY change_date, pub_date
-              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+          SELECT * EXCLUDE (share_trade_total),
+                 -- ★★ 「定期报告」行的 share_trade_total 会【回退】到某个已被
+                 --   解禁事件超越的旧值 —— 源数据问题，实测 603536.XSHG：
+                 --     2018-06-13 限售股份上市  流通 6025.41万
+                 --     2018-06-30 定期报告      流通 4200.00万  <- 回退
+                 --     2018-12-31 定期报告      流通 6025.41万  <- 又回来
+                 --   双键 as-of 按 change_date 取最大，就会在 2018-06~12 期间
+                 --   取到那个错的 4200万，把流通市值算成 3.46 亿（真值 4.97 亿），
+                 --   于是它在「流通市值升序取最小 N 只」里被顶到第 1 名 ——
+                 --   聚宽同期根本没买它。这是 v0b 对标残差的成因之一。
+                 --   规模：全表 7.74% 的行「流通降而总股本未降」，其中 77% 是定期报告。
+                 -- 护栏：定期报告【不得】把流通股压到低于最近一个【事件行】的值。
+                 --   只管定期报告 —— 回购 / 承诺限售 是事件行，仍可正常下调流通股。
+                 CASE WHEN change_reason = '定期报告' AND ev_f IS NOT NULL
+                      THEN greatest(share_trade_total, ev_f)
+                      ELSE share_trade_total END AS share_trade_total
+          FROM (
+            SELECT *,
+                   COALESCE(share_b, last_value(share_b IGNORE NULLS) OVER w, 0) AS bf_b,
+                   COALESCE(share_h, last_value(share_h IGNORE NULLS) OVER w, 0) AS bf_h,
+                   last_value(CASE WHEN change_reason <> '定期报告'
+                                   THEN share_trade_total END IGNORE NULLS) OVER w AS ev_f
+            FROM read_parquet('{shr}')
+            WHERE share_trade_total IS NOT NULL AND share_trade_total > 0
+              AND pub_date IS NOT NULL
+            WINDOW w AS (PARTITION BY code ORDER BY change_date, pub_date
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+          )
         )
       )
       WINDOW win AS (PARTITION BY code ORDER BY pub_date
@@ -614,13 +634,20 @@ def verify(con):
                          greatest(share_trade_total - bf_b - bf_h, 0)*1e4 AS fs,
                          share_total*1e4 AS ts,
                          {'c': change_date, 'p': pub_date} AS ord
-                  FROM (SELECT *,
+                  FROM (SELECT * EXCLUDE (share_trade_total),
+                          -- 与面板同一护栏：定期报告不得低于最近事件行（见 _shr 注释）
+                          CASE WHEN change_reason = '定期报告' AND ev_f IS NOT NULL
+                               THEN greatest(share_trade_total, ev_f)
+                               ELSE share_trade_total END AS share_trade_total
+                        FROM (SELECT *,
                           COALESCE(share_b, last_value(share_b IGNORE NULLS) OVER w, 0) bf_b,
-                          COALESCE(share_h, last_value(share_h IGNORE NULLS) OVER w, 0) bf_h
+                          COALESCE(share_h, last_value(share_h IGNORE NULLS) OVER w, 0) bf_h,
+                          last_value(CASE WHEN change_reason <> '定期报告'
+                              THEN share_trade_total END IGNORE NULLS) OVER w AS ev_f
                         FROM read_parquet('%s')
                         WHERE share_trade_total > 0 AND pub_date IS NOT NULL
                         WINDOW w AS (PARTITION BY code ORDER BY change_date, pub_date
-                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)))
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))))
             WINDOW win AS (PARTITION BY code ORDER BY pub_date
                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
           ) WHERE _rn = 1
@@ -642,6 +669,25 @@ def verify(con):
     check(r[0] >= 99.0, '流通股本与股份变动表 PIT 值吻合 %.2f%% >= 99%%' % r[0])
     check(r[1] <= 0.5, '流通股本被低估>10%% 仅 %.2f%%（单向偏差，小市值按升序选股）' % r[1])
     check(r[2] >= 99.0, '总股本吻合 %.2f%% >= 99%%（对照组）' % r[2])
+
+    # ★ 上面三条把护栏加进了【两侧】，对护栏本身是同义反复。所以单独盯住护栏的
+    #   【规模】：源数据若变（修好了、或坏得更多），这个比例会动，
+    #   必须被发现而不是静默通过。
+    r = con.execute("""
+        WITH s AS (
+          SELECT change_reason, share_trade_total f,
+                 last_value(CASE WHEN change_reason <> '定期报告'
+                     THEN share_trade_total END IGNORE NULLS) OVER w AS ev_f
+          FROM read_parquet('%s')
+          WHERE share_trade_total > 0 AND pub_date IS NOT NULL
+          WINDOW w AS (PARTITION BY code ORDER BY change_date, pub_date
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))
+        SELECT round(100.0*sum(CASE WHEN change_reason='定期报告' AND ev_f IS NOT NULL
+                 AND f < ev_f - 1e-6 THEN 1 ELSE 0 END)/count(*), 2) FROM s
+    """ % os.path.join(ROOT, 'std', 'share_change.parquet')).fetchone()
+    check(4.0 <= r[0] <= 10.0,
+          '定期报告回退被护栏修正 %.2f%% 的行（预期 4~10%%，建立时实测 6.90%%）'
+          % r[0])
 
     for col, lim in (('close_hfq', 0.001), ('floatmv', 0.02), ('sw_l1_name', 0.05)):
         r = con.execute('SELECT avg(CASE WHEN %s IS NULL THEN 1.0 ELSE 0 END) FROM %s'
