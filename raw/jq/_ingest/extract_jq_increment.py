@@ -96,21 +96,33 @@ def grab_indicator():
 
 # ---------------------------------------------------------------- 2 三大报表
 def grab_financials():
-    """三大报表也按 statDate 重抽最近两期。"""
-    for name, tbl in (('income', income), ('balance', balance),
-                      ('cash_flow', cash_flow)):
+    """三大报表：走 finance.STK_*，【不是】get_fundamentals(query(income))。
+
+    [!] 这两个源的 schema 不同，混用会在合并时报「缺列」。
+        既有的 raw/jq/financials/{income,balance,cashflow}.parquet 来自
+        extract_jq_financials.py 的 finance.STK_INCOME_STATEMENT 等，
+        带 company_id / company_name / a_code / b_code / h_code / pub_date，
+        而 get_fundamentals(query(income)) 没有这些列。
+        第一版我用错了源，实测三张表全部合并失败。
+
+    按 pub_date >= SINCE 抽 —— 报表是事件类（一次公告一行），不是按报告期覆盖。
+    """
+    codes = list(get_all_securities('stock').index)
+    jobs = [('fin_income',    finance.STK_INCOME_STATEMENT),
+            ('fin_balance',   finance.STK_BALANCE_SHEET),
+            ('fin_cash_flow', finance.STK_CASHFLOW_STATEMENT)]
+    for name, tbl in jobs:
         acc = []
-        for q in QUARTERS:
-            off = 0
-            while True:
-                df = get_fundamentals(query(tbl).limit(PAGE).offset(off), statDate=q)
-                if df is None or len(df) == 0:
-                    break
-                acc.append(df)
-                off += PAGE
-                if len(df) < PAGE:
-                    break
-        _save('fin_%s' % name, pd.concat(acc, ignore_index=True) if acc else None)
+        try:
+            for part in _chunks(codes, CHUNK):
+                df = finance.run_query(query(tbl).filter(
+                    tbl.code.in_(part), tbl.pub_date >= SINCE))
+                if df is not None and len(df):
+                    acc.append(df)
+        except Exception as e:                                  # noqa: BLE001
+            print('  [!] %s 抽取失败: %s' % (name, str(e)[:80]))
+            continue
+        _save(name, pd.concat(acc, ignore_index=True) if acc else None)
 
 
 # ---------------------------------------------------------------- 3 事件类
