@@ -112,6 +112,82 @@ def main():
 
     if '--verify' in sys.argv:
         verify()
+    if '--update-baseline' in sys.argv:
+        update_baseline()
+
+
+def _snapshot():
+    """按基线的 key 集合重新取一遍当前值。"""
+    base = json.loads(io.open(BASE, encoding='utf-8').read())
+    con = duckdb.connect(TARGET, read_only=True)
+    cur = {}
+    for k in base:
+        kind, name = k.split(':', 1)
+        try:
+            if kind in ('view', 'table'):
+                cur[k] = con.execute('select count(*) from "%s"' % name).fetchone()[0]
+            elif kind == 'macro':
+                fn, arg = name.split('(')
+                cur[k] = con.execute("select count(*) from %s(DATE '%s')"
+                                     % (fn, arg.rstrip(')'))).fetchone()[0]
+            else:
+                d = name.split('@')[1]
+                cur[k] = con.execute("""select name from security_name
+                    where code='601766.XSHG' and valid_from <= DATE '%s'
+                    and (valid_to is null or valid_to > DATE '%s')
+                    and known_from <= DATE '%s'""" % (d, d, d)).fetchone()[0]
+        except Exception as e:                              # noqa: BLE001
+            cur[k] = 'ERR: %s' % str(e)[:60]
+    con.close()
+    return base, cur
+
+
+def update_baseline():
+    """补完新数据后刷新基线行数。
+
+    ★ 护栏：只允许【增加】。行数变小 = 数据丢了，那正是基线该拦住的事 ——
+      如果这时候还允许刷新，基线就退化成「橡皮图章」，等于没有。
+      语义类（macro / pit）的值必须【完全不变】才放行。
+    """
+    base, cur = _snapshot()
+    grew, shrank, changed_sem = [], [], []
+    for k, old in sorted(base.items()):
+        new = cur[k]
+        if new == old:
+            continue
+        kind = k.split(':', 1)[0]
+        if kind in ('macro', 'pit') or not isinstance(new, int) \
+                or not isinstance(old, int):
+            changed_sem.append((k, old, new))
+        elif new > old:
+            grew.append((k, old, new))
+        else:
+            shrank.append((k, old, new))
+
+    print('\n=== 刷新基线 ===')
+    for k, o, n in grew:
+        print('  ↑ %-44s %-12s -> %s  (+%d)' % (k, o, n, n - o))
+    if shrank:
+        print('\n❌ 这些行数【变小】了 —— 数据丢失，拒绝刷新基线：')
+        for k, o, n in shrank:
+            print('   %-44s %-12s -> %s  (%d)' % (k, o, n, n - o))
+        sys.exit(1)
+    if changed_sem:
+        print('\n❌ 语义类基线（macro / pit）变了 —— 拒绝刷新，先查为什么：')
+        for k, o, n in changed_sem:
+            print('   %-44s %-12s -> %s' % (k, o, n))
+        sys.exit(1)
+    if not grew:
+        print('  基线已是最新，无需刷新')
+        return
+    bak = BASE + '.bak'
+    io.open(bak, 'w', encoding='utf-8').write(
+        json.dumps(base, ensure_ascii=False, indent=2, sort_keys=True))
+    io.open(BASE, 'w', encoding='utf-8').write(
+        json.dumps(cur, ensure_ascii=False, indent=2, sort_keys=True))
+    print('\n✅ 已刷新 %d 项（旧基线备份到 %s）'
+          % (len(grew), os.path.relpath(bak, ROOT)))
+
 
 def verify():
     base = json.loads(io.open(BASE, encoding='utf-8').read())
