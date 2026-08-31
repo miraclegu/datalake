@@ -59,21 +59,42 @@ LOADERS = [
 ]
 
 
+def _stem(fn):
+    """去掉扩展名。单独提出来是因为 .csv.gz 是【两级】扩展名 ——
+    第一版在两处各硬写了一次切片长度，对 .parquet 对、对 .csv.gz 少切一个字符，
+    把 fundamentals_indicator_q 显示成了 fundamentals_indicator_。"""
+    for ext in ('.csv.gz', '.parquet', '.csv'):
+        if fn.endswith(ext):
+            return fn[:-len(ext)]
+    return fn
+
+
+def _src(path):
+    """增量可能是 .csv.gz 也可能是 .parquet —— 用对应的读法。
+
+    [!] csv.gz 一律 all_varchar=true 读进来，再按目标表的列类型 CAST。
+        不这么做的话，DuckDB 会按内容猜类型：同一列在增量里全是数字、
+        在旧表里是字符串（如 '002054' 会被猜成 2054），合并时就静默错位。
+    """
+    if path.endswith('.csv.gz'):
+        return "read_csv_auto('%s', all_varchar=true, compression='gzip')" % path
+    return "read_parquet('%s')" % path
+
+
 def merge_one(con, inc_path, dst_path, keys, dry):
     name = os.path.basename(dst_path)
-    n_inc = con.execute("SELECT count(*) FROM read_parquet(?)", [inc_path]).fetchone()[0]
+    src = _src(inc_path)
+    n_inc = con.execute("SELECT count(*) FROM %s" % src).fetchone()[0]
     if not os.path.exists(dst_path):
-        print('  %-30s 目标不存在 -> 直接落地 %d 行' % (name, n_inc))
-        if not dry:
-            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-            con.execute("COPY (SELECT * FROM read_parquet('%s')) TO '%s' (FORMAT PARQUET)"
-                        % (inc_path, dst_path))
-        return n_inc, n_inc
+        print('  %-30s ❌ 目标不存在 —— 增量包不能用来建表' % name)
+        print('     （全 varchar 的 csv 落地会把所有列类型做错，且没有旧表可对照）')
+        print('     先用对应的全量 extract 脚本建一次，再用增量补。')
+        return None, None
 
     cols_old = [r[0] for r in con.execute(
         "DESCRIBE SELECT * FROM read_parquet(?) LIMIT 1", [dst_path]).fetchall()]
     cols_inc = [r[0] for r in con.execute(
-        "DESCRIBE SELECT * FROM read_parquet(?) LIMIT 1", [inc_path]).fetchall()]
+        "DESCRIBE SELECT * FROM %s LIMIT 1" % src).fetchall()]
     missing = [c for c in cols_old if c not in cols_inc]
     extra = [c for c in cols_inc if c not in cols_old]
     if missing or extra:
@@ -87,14 +108,21 @@ def merge_one(con, inc_path, dst_path, keys, dry):
         return None, None
 
     n_old = con.execute("SELECT count(*) FROM read_parquet(?)", [dst_path]).fetchone()[0]
-    on = ' AND '.join('o."%s" IS NOT DISTINCT FROM i."%s"' % (c, c) for c in k)
-    sel = ','.join('"%s"' % c for c in cols_old)
+    # ★ 增量的每一列都 CAST 成旧表的类型 —— csv 读进来是全 varchar，
+    #   不 CAST 的话 UNION ALL 会把整表拖成 varchar，写回去类型就全毁了。
+    types = {r[0]: r[1] for r in con.execute(
+        "DESCRIBE SELECT * FROM read_parquet(?) LIMIT 1", [dst_path]).fetchall()}
+    sel_inc = ','.join('try_cast("%s" AS %s) AS "%s"' % (c, types[c], c)
+                       for c in cols_old)
+    sel_old = ','.join('"%s"' % c for c in cols_old)
+    on = ' AND '.join('o."%s"::VARCHAR IS NOT DISTINCT FROM i."%s"::VARCHAR'
+                      % (c, c) for c in k)
     sql = """
-      SELECT %s FROM read_parquet('%s') i
+      SELECT %s FROM %s i
       UNION ALL
       SELECT %s FROM read_parquet('%s') o
-      WHERE NOT EXISTS (SELECT 1 FROM read_parquet('%s') i WHERE %s)
-    """ % (sel, inc_path, sel, dst_path, inc_path, on)
+      WHERE NOT EXISTS (SELECT 1 FROM %s i WHERE %s)
+    """ % (sel_inc, src, sel_old, dst_path, src, on)
     n_new = con.execute("SELECT count(*) FROM (%s)" % sql).fetchone()[0]
     delta = n_new - n_old
     print('  %-30s %8d -> %8d  (%+d，增量 %d 行，键 %s)'
@@ -122,17 +150,20 @@ def main():
     tmpd = tempfile.mkdtemp(prefix='jqinc_')
     with tarfile.open(a.tar) as t:
         t.extractall(tmpd)
-    incs = sorted(f for f in os.listdir(tmpd) if f.endswith('.parquet'))
+    # 增量包里是 .csv.gz（聚宽研究环境没有 pyarrow，见 extract 脚本的环境约束）。
+    # 兼容 .parquet 是为了以后环境变了不用改这里。
+    incs = sorted(f for f in os.listdir(tmpd)
+                  if f.endswith('.csv.gz') or f.endswith('.parquet'))
     print('=' * 74)
     print('合并聚宽增量  %s%s' % (os.path.basename(a.tar), '  [dry-run]' if a.dry_run else ''))
     print('=' * 74)
-    print('包内 %d 个文件: %s' % (len(incs), [x[:-8] for x in incs]))
+    print('包内 %d 个文件: %s' % (len(incs), [_stem(x) for x in incs]))
     print()
 
     con = duckdb.connect(':memory:')
     bad, touched = 0, []
     for fn in incs:
-        stem = fn[:-8]
+        stem = _stem(fn)
         if stem not in TARGETS:
             print('  %-30s ⚠ 不在 TARGETS 里，跳过' % stem)
             continue

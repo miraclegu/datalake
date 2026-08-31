@@ -20,6 +20,13 @@
 —— 必须合并：load_jq_indicator_q 是 `COPY (SELECT ... FROM raw) TO std`，
    raw 只放增量的话历史会被整段抹掉。
 
+## 环境约束（踩过）
+
+聚宽研究环境是 **Python 3.6 + 老 pandas，没装 pyarrow / fastparquet**：
+  · 不能 `df.to_parquet(...)` —— 抛 ImportError，本脚本一律存 `.csv.gz`
+  · 不用命名聚合（`df.agg(x=('a','sum'))` 那套）
+  · f-string 可用，但 walrus / dataclass 之类 3.8+ 语法不行
+
 **跑完请执行文末的清理 cell**，否则 Out[n] 会一直占内存。
 """
 import datetime
@@ -43,11 +50,18 @@ _saved = []
 
 
 def _save(name, df):
+    """存 csv.gz，【不用 to_parquet】。
+
+    [!] 聚宽研究环境是 Python 3.6 + 老 pandas，【没装 pyarrow / fastparquet】——
+        df.to_parquet 会抛 ImportError: Unable to find a usable engine。
+        既有的 extract_jq_indicator_q.py / round3.py 早就写着这条，我第一版没照做。
+        gzip 后体积与 parquet 同量级，本地 duckdb 的 read_csv_auto 直接能读。
+    """
     if df is None or len(df) == 0:
         print('  [空] %s' % name)
         return
-    p = os.path.join(OUT, name + '.parquet')
-    df.to_parquet(p, index=False)
+    p = os.path.join(OUT, name + '.csv.gz')
+    df.to_csv(p, index=False, compression='gzip', encoding='utf-8')
     _saved.append(p)
     print('  [OK] %-26s %7d 行  %.1f MB' % (name, len(df), os.path.getsize(p) / 1e6))
 
