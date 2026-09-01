@@ -191,6 +191,34 @@ def merge_one(con, inc_path, dst_path, keys, dry):
     return n_old, n_new
 
 
+# ★ 交易日历不进 duckdb —— 它不是行情表，消费者是【实盘模块】
+#   assay/live.py，需要判断"下一个交易日是哪天"。面板只有有行情的日子，
+#   推不出未来；春节/国庆也无法从星期推。所以从聚宽抽来直接落到
+#   assay/live/（入版本控制），拿不到就让实盘模块响亮报错。
+CAL_DST = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))), 'assay', 'live',
+    'trade_calendar.json')
+
+
+def _calendar(tmpd, dry):
+    src = os.path.join(tmpd, 'trade_calendar.json')
+    if not os.path.exists(src):
+        return
+    import json
+    d = json.load(open(src))
+    n, mx = len(d.get('days') or []), d.get('max')
+    if dry:
+        print('  %-30s [dry] %d 天，最远 %s' % ('trade_calendar', n, mx))
+        return
+    os.makedirs(os.path.dirname(CAL_DST), exist_ok=True)
+    tmp = CAL_DST + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, CAL_DST)
+    print('  %-30s ✓ %d 天，最远 %s  -> %s'
+          % ('trade_calendar', n, mx, os.path.relpath(CAL_DST)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('tar')
@@ -207,6 +235,7 @@ def main():
     # 兼容 .parquet 是为了以后环境变了不用改这里。
     incs = sorted(f for f in os.listdir(tmpd)
                   if f.endswith('.csv.gz') or f.endswith('.parquet'))
+    _calendar(tmpd, a.dry_run)
     print('=' * 74)
     print('合并聚宽增量  %s%s' % (os.path.basename(a.tar), '  [dry-run]' if a.dry_run else ''))
     print('=' * 74)

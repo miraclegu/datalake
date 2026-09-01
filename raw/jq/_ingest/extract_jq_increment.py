@@ -30,6 +30,7 @@
 **跑完请执行文末的清理 cell**，否则 Out[n] 会一直占内存。
 """
 import datetime
+import json
 import os
 import tarfile
 
@@ -150,6 +151,31 @@ def grab_events():
         _save(name, pd.concat(acc, ignore_index=True) if acc else None)
 
 
+# ------------------------------------------------------- 3.5 未来交易日历
+def grab_calendar():
+    """未来交易日 —— 实盘模块（assay/live.py）判断"下一个交易日是哪天"要用。
+
+    ★ 为什么必须从聚宽抽而不是本地推：本地 `PanelFeed.trading_days` 来自
+      **面板**（有行情的日子），永远不含未来；而春节/国庆的休市安排
+      **无法从星期推出**。实盘模块拿不到就直接报错，不猜 ——
+      猜错一天 = 该调仓的日子不提示，或者休市日发一堆单。
+
+    get_all_trade_days() 返回当年全部交易日（含未来），是聚宽的权威日历。
+    """
+    days = [str(d)[:10] for d in get_all_trade_days()]
+    today = str(datetime.date.today())
+    fut = [d for d in days if d >= today]
+    obj = {'days': days, 'source': 'jq.get_all_trade_days',
+           'updated': today, 'n_future': len(fut),
+           'max': days[-1] if days else None}
+    p = os.path.join(OUT, 'trade_calendar.json')
+    with open(p, 'w') as f:
+        json.dump(obj, f)
+    _saved.append(p)
+    print('  trade_calendar.json  共 %d 天，未来 %d 天，最远 %s'
+          % (len(days), len(fut), obj['max']))
+
+
 # ---------------------------------------------------------------- 4 打包
 def pack():
     ts = str(datetime.date.today()).replace('-', '')
@@ -168,12 +194,14 @@ def pack():
 print('=' * 70)
 print('聚宽增量补数   SINCE=%s   报告期=%s' % (SINCE, QUARTERS))
 print('=' * 70)
-print('[1/3] 指标 indicator')
+print('[1/4] 指标 indicator')
 grab_indicator()
-print('[2/3] 三大报表')
+print('[2/4] 三大报表')
 grab_financials()
-print('[3/3] 事件类（分红/名称/状态/预告/股本）')
+print('[3/4] 事件类（分红/名称/状态/预告/股本）')
 grab_events()
+print('[4/4] 未来交易日历')
+grab_calendar()
 pack()
 
 # ============================== 清理 cell ===================================
