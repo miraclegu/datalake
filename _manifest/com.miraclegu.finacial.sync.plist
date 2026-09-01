@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  每交易日 18:10 跑数据同步。
+
+  ★ 为什么用 launchd 而不是 serve.py 里的定时线程：
+    daily_snapshot.py 是【漏一天永久丢失】的（tdx 的名称/分类/板块成分
+    是 type-1 覆盖写，当天状态错过就再也重建不出来）。把它挂在
+    「看板恰好开着」上不可靠 —— 看板会被关、机器会睡。
+    launchd 还有一个关键属性：机器在预定时刻睡着时，醒来会补跑一次。
+
+  ★ 为什么按【日历日】而不是判断是否交易日：脚本自己幂等，非交易日
+    tdx2db cron 会说"已是最新"直接退出，代价几秒。把"今天是不是交易日"
+    的判断放调度器里等于把日历逻辑抄第二遍。
+
+  安装：
+    cp datalake/_manifest/com.miraclegu.finacial.sync.plist ~/Library/LaunchAgents/
+    launchctl load  ~/Library/LaunchAgents/com.miraclegu.finacial.sync.plist
+  查看：
+    launchctl list | grep finacial
+    tail -f /Users/guhao/finacial/datalake/_manifest/launchd.out
+  立刻跑一次（测试）：
+    launchctl start com.miraclegu.finacial.sync
+  卸载：
+    launchctl unload ~/Library/LaunchAgents/com.miraclegu.finacial.sync.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.miraclegu.finacial.sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/guhao/finacial/datalake/sync_daily.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/guhao/finacial/datalake</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>18</integer>
+        <key>Minute</key><integer>10</integer>
+    </dict>
+
+    <!-- 机器睡过了预定时刻，醒来补跑一次 —— 这正是不用 cron 的理由 -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/guhao/finacial/datalake/_manifest/launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/guhao/finacial/datalake/_manifest/launchd.err</string>
+
+    <!-- PATH 里要有 python3；launchd 的默认环境很窄 -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
