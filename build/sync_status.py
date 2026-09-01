@@ -43,6 +43,19 @@ CHECKS = [
      "SELECT max(board_plan_pub_date) FROM read_parquet('{R}/std/dividend.parquet')"),
     ('share_change', '股本变动 pub_date', 'B',
      "SELECT max(pub_date) FROM read_parquet('{R}/std/share_change.parquet')"),
+    # ★ 三大报表此前【完全没被监控】—— 实测卡在 2026-08-24 而指标已到 08-31，
+    #   差 5 个交易日，而没有任何地方会说出来。
+    #   两条实盘策略（红利指数增强 / froec_traded）不用这三张表（只用
+    #   t_indicator / t_dividend / t_beta / t_universe），但 红利价值.py 与
+    #   build_jqfactor_q.py 用，所以滞后仍然会静默影响那条线。
+    ('fin_income', '利润表 pub_date', 'B',
+     "SELECT max(pub_date) FROM read_parquet('{R}/raw/jq/financials/income.parquet')"),
+    ('fin_balance', '资产表 pub_date', 'B',
+     "SELECT max(pub_date) FROM read_parquet('{R}/raw/jq/financials/balance.parquet')"),
+    ('fin_cashflow', '现金流量表 pub_date', 'B',
+     "SELECT max(pub_date) FROM read_parquet('{R}/raw/jq/financials/cashflow.parquet')"),
+    ('fin_forcast', '业绩预告 pub_date', 'B',
+     "SELECT max(pub_date) FROM read_parquet('{R}/raw/jq/stk_fin_forcast.parquet')"),
 ]
 
 
@@ -74,7 +87,12 @@ def collect():
     for key, name, leg, sql in CHECKS:
         try:
             v = con.execute(sql.format(R=ROOT)).fetchone()[0]
-            v = v.date() if hasattr(v, 'date') else v
+            # ★ 各表的日期列类型不一：parquet 里可能是 DATE/TIMESTAMP，
+            #   也可能是 VARCHAR（stk_fin_forcast 全列 str）。都归一成 date。
+            if hasattr(v, 'date'):
+                v = v.date()
+            elif isinstance(v, str):
+                v = datetime.date.fromisoformat(v[:10]) if v[:4].isdigit() else None
         except Exception as e:                              # noqa: BLE001
             items.append({'key': key, 'name': name, 'leg': leg, 'max': None,
                           'lag_days': None, 'error': str(e)[:120]})

@@ -25,6 +25,7 @@
 """
 import argparse
 import os
+import re
 import shutil
 import sys
 import tarfile
@@ -57,20 +58,60 @@ TARGETS = {
     'dim_name_history': (os.path.join(DL, 'dim_name_history.csv'), None),
     'dim_status_change': (os.path.join(DL, 'dim_status_change.csv'), None),
     'stk_fin_forcast':  (os.path.join(DL, 'stk_fin_forcast.csv'), None),
-    # 三大报表在 downloads 下是【按年分片】(income_2026.csv.gz)，
-    # 增量是跨年的一坨，合进哪一片都不对 —— 先不自动合，见 README。
-    'fin_income':       (None, None),
-    'fin_balance':      (None, None),
-    'fin_cash_flow':    (None, None),
     # share_change 的源是 stk_capital_change.csv.gz，走 load_jq_share_change.py
     'share_change':     (os.path.join(DL, 'stk_capital_change.csv.gz'), None),
 }
+
+# ★ 三大报表走【整文件替换】而不是行级合并。
+#   增量脚本按报告期年份整年重抽，文件名与全量一致（income_2026.csv.gz），
+#   而 load_jq_financials.py 是 glob 所有年份文件重建 parquet ——
+#   所以换掉当年那几个文件、重跑 loader 就是完整刷新。
+#   这样就完全绕开了「缺列 / 类型错位 / 去重键选错」那一类风险：没有合并，
+#   就没有合并的坑。代价是每次多传几 MB（2026 三张表约 5 MB）。
+REPLACE_RE = re.compile(r'^(income|balance|cashflow|indicator|indicator_q)'
+                        r'_[12][0-9]{3}$')
+
+
+def replace_file(inc_path, dst_path, dry):
+    """整文件替换。旧文件留 .bak —— 万一新抽的有问题还能退回去。"""
+    name = os.path.basename(dst_path)
+    n_new = _count(inc_path)
+    n_old = _count(dst_path) if os.path.exists(dst_path) else 0
+    if n_new is None:
+        print('  %-30s ❌ 增量读不出行数' % name)
+        return None, None
+    # ★ 整文件替换最大的风险是【新的比旧的少】—— 抽取中途配额耗尽会给出
+    #   一个"看着正常"的小文件，替换掉就静默丢数据。所以行数缩水直接拒绝。
+    if n_old and n_new < n_old * 0.95:
+        print('  %-30s ❌ 拒绝替换：新 %s 行 < 旧 %s 行的 95%%'
+              % (name, format(n_new, ','), format(n_old, ',')))
+        print('     整年重抽本该 >= 旧的（重述只会增行）。多半是抽取中断/配额耗尽。')
+        return None, None
+    if dry:
+        print('  %-30s [dry] 替换 %s -> %s 行'
+              % (name, format(n_old, ','), format(n_new, ',')))
+        return n_old, n_new
+    if os.path.exists(dst_path):
+        shutil.move(dst_path, dst_path + '.bak')
+    shutil.copy(inc_path, dst_path)
+    print('  %-30s ✓ 整文件替换 %s -> %s 行'
+          % (name, format(n_old, ','), format(n_new, ',')))
+    return n_old, n_new
+
+
+def _count(path):
+    try:
+        con = duckdb.connect()
+        return con.execute('SELECT count(*) FROM %s' % _dst_read(path)).fetchone()[0]
+    except Exception:                                           # noqa: BLE001
+        return None
+
 
 # 合并完该跑哪些 loader（顺序有依赖）
 LOADERS = [
     ('fundamentals_indicator_q', 'build/load_jq_indicator_q.py'),
     ('stk_xr_xd',                'build/load_jq_round3.py'),
-    ('fin_income',               'build/load_jq_financials.py'),
+    ('income_2026',              'build/load_jq_financials.py'),
     ('dim_name_history',         'build/load_jq_dimensions.py'),
     ('dim_status_change',        'build/load_jq_dimensions.py'),
     ('share_change',             'build/load_jq_share_change.py'),
@@ -85,6 +126,28 @@ def _stem(fn):
         if fn.endswith(ext):
             return fn[:-len(ext)]
     return fn
+
+
+# ★ 这些表的 CSV【DuckDB 读不了】—— 必须走 pandas。
+#   stk_fin_forcast 的 content 是大段中文预告正文，含换行；多行字段虽然加了
+#   引号，但文件里还有 6 处**裸换行**（未加引号），DuckDB 的状态机直接报
+#   "reached an invalid state"，而它上一层的 try/except 会把整张表跳过 ——
+#   于是"业绩预告没更新"这件事只在日志里留一行，很容易被忽略。
+#   pandas 能原样往返（文件本来就是 pandas 写的），实测 124,094 行无损。
+#   ❌ 不用 ignore_errors / strict_mode=false：那会静默丢行且丢多少不知道。
+PANDAS_CSV = {'stk_fin_forcast'}
+
+
+def _read_pandas(path):
+    """用【修读器】读成 DataFrame（全字符串），供 register 进 DuckDB。
+
+    ★ 不用裸 pandas.read_csv —— 它在这个文件上不报错但读错（静默产出
+      11 行垃圾）。csv_repair 会做内容校验，读不干净就抛。
+    """
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from csv_repair import read_forcast_df
+    return read_forcast_df(path, verbose=False)[0]
 
 
 def _src(path):
@@ -120,12 +183,21 @@ def _copy_to(path):
     return "(FORMAT PARQUET)"
 
 
-def merge_one(con, inc_path, dst_path, keys, dry):
+def merge_one(con, inc_path, dst_path, keys, dry, use_pandas=False):
     name = os.path.basename(dst_path)
-    src = _src(inc_path)
-    dst = _dst_read(dst_path)
+    if use_pandas:
+        # 两边都用 pandas 读，注册成临时视图后走【同一套】合并 SQL ——
+        # 不为这张表另写一条合并路径，否则去重/CAST/行数校验都要写第二遍。
+        con.register('_inc_pd', _read_pandas(inc_path))
+        src = '(SELECT * FROM _inc_pd)'
+        dst = '(SELECT * FROM _dst_pd)' if os.path.exists(dst_path) else None
+        if dst:
+            con.register('_dst_pd', _read_pandas(dst_path))
+    else:
+        src = _src(inc_path)
+        dst = _dst_read(dst_path)
     n_inc = con.execute("SELECT count(*) FROM %s" % src).fetchone()[0]
-    if not os.path.exists(dst_path):
+    if not os.path.exists(dst_path) or dst is None:
         print('  %-30s ❌ 目标不存在 —— 增量包不能用来建表' % name)
         print('     （全 varchar 的 csv 落地会把所有列类型做错，且没有旧表可对照）')
         print('     先用对应的全量 extract 脚本建一次，再用增量补。')
@@ -188,6 +260,11 @@ def merge_one(con, inc_path, dst_path, keys, dry):
         con.execute("COPY (%s) TO '%s' %s" % (sql, tmp, _copy_to(dst_path)))
         shutil.move(dst_path, dst_path + '.bak')
         shutil.move(tmp, dst_path)
+    for v in ('_inc_pd', '_dst_pd'):
+        try:
+            con.unregister(v)
+        except Exception:                                       # noqa: BLE001
+            pass
     return n_old, n_new
 
 
@@ -246,6 +323,19 @@ def main():
     bad, touched = 0, []
     for fn in incs:
         stem = _stem(fn)
+        if REPLACE_RE.match(stem):
+            # 按年分片的表：整文件替换，不走合并
+            try:
+                o, n = replace_file(os.path.join(tmpd, fn),
+                                    os.path.join(DATA, DL, fn), a.dry_run)
+            except Exception as e:                              # noqa: BLE001
+                print('  %-30s ❌ 替换异常：%s' % (stem, str(e).split(chr(10))[0][:70]))
+                o, n = None, None
+            if o is None:
+                bad += 1
+            elif n != o:
+                touched.append(stem)
+            continue
         if stem not in TARGETS:
             print('  %-30s ⚠ 不在 TARGETS 里，跳过' % stem)
             continue
@@ -259,7 +349,7 @@ def main():
         #   在没有这层保护时它把后面的 stk_xr_xd 也一起带没了。
         try:
             o, n = merge_one(con, os.path.join(tmpd, fn), os.path.join(DATA, rel),
-                             keys, a.dry_run)
+                             keys, a.dry_run, use_pandas=(stem in PANDAS_CSV))
         except Exception as e:                                  # noqa: BLE001
             print('  %-30s ❌ 合并异常，跳过：%s' % (stem, str(e).split(chr(10))[0][:70]))
             o, n = None, None

@@ -38,7 +38,10 @@ import pandas as pd
 from jqdata import *
 
 # ============================== 改这两处 ====================================
-SINCE = '2026-08-20'      # 事件类表按 pub_date >= SINCE 抽。留几天重叠，合并会去重
+# 事件类表按 pub_date >= SINCE 抽。★ 要比本地最新 pub_date 早几天 ——
+# 留重叠是刻意的：合并按自然键去重，重叠不会重复，而缺口会静默丢数据。
+# 本地当前最新（2026-09-01 查）：指标/分红 2026-08-31、三大报表 2026-08-24。
+SINCE = '2026-08-20'
 QUARTERS = ['2026q2', '2026q1']   # 财务类重抽这几个报告期（顺带捡回重述）
 # ============================================================================
 
@@ -96,34 +99,55 @@ def grab_indicator():
 
 
 # ---------------------------------------------------------------- 2 三大报表
+# ★ 三大报表【不做行级增量】，而是按报告期年份【整年重抽、整文件替换】。
+#
+# 理由：全量抽取（extract_jq_financials.py）本来就是按 report_date 年份分片存
+#   income_YYYY.csv.gz / balance_YYYY.csv.gz / cashflow_YYYY.csv.gz，
+#   而 load_jq_financials.py 是 glob 所有年份文件重建 parquet。
+#   所以只要把当年那几个文件换掉、重跑 loader，就是完整刷新 —— 不需要
+#   任何合并逻辑，也就没有「增量缺列 / 类型错位 / 去重键选错」这些风险。
+#
+# 🔴 第一版踩的两个坑，都很静默：
+#   1. 用 get_fundamentals(query(income)) 抽 —— 与 finance.STK_* 的 schema
+#      不同（缺 company_id / a_code / pub_date 等），合并时报缺列
+#   2. 改用 finance.STK_* 后**漏了 `report_type == 0`** —— 那会把母公司报表
+#      一起拉进来，行数翻倍、合并/母公司口径混在一张表里。
+#      全量抽取里有这个过滤（见 extract_jq_financials.fetch_year），
+#      增量必须一模一样，否则两部分数据口径不同而**没有任何报错**。
+FIN_YEARS = [2026, 2025]      # 重抽这几个【报告期年份】，顺带捡回重述
+FIN_PAGE = 3000
+
+
 def grab_financials():
-    """三大报表：走 finance.STK_*，【不是】get_fundamentals(query(income))。
-
-    [!] 这两个源的 schema 不同，混用会在合并时报「缺列」。
-        既有的 raw/jq/financials/{income,balance,cashflow}.parquet 来自
-        extract_jq_financials.py 的 finance.STK_INCOME_STATEMENT 等，
-        带 company_id / company_name / a_code / b_code / h_code / pub_date，
-        而 get_fundamentals(query(income)) 没有这些列。
-        第一版我用错了源，实测三张表全部合并失败。
-
-    按 pub_date >= SINCE 抽 —— 报表是事件类（一次公告一行），不是按报告期覆盖。
-    """
-    codes = list(get_all_securities('stock').index)
-    jobs = [('fin_income',    finance.STK_INCOME_STATEMENT),
-            ('fin_balance',   finance.STK_BALANCE_SHEET),
-            ('fin_cash_flow', finance.STK_CASHFLOW_STATEMENT)]
-    for name, tbl in jobs:
-        acc = []
-        try:
-            for part in _chunks(codes, CHUNK):
-                df = finance.run_query(query(tbl).filter(
-                    tbl.code.in_(part), tbl.pub_date >= SINCE))
-                if df is not None and len(df):
-                    acc.append(df)
-        except Exception as e:                                  # noqa: BLE001
-            print('  [!] %s 抽取失败: %s' % (name, str(e)[:80]))
-            continue
-        _save(name, pd.concat(acc, ignore_index=True) if acc else None)
+    """按报告期年份整年重抽，文件名与全量一致 —— 合并时整文件替换。"""
+    jobs = [('income',   finance.STK_INCOME_STATEMENT,   'report_date'),
+            ('balance',  finance.STK_BALANCE_SHEET,      'report_date'),
+            ('cashflow', finance.STK_CASHFLOW_STATEMENT, 'report_date')]
+    for name, tbl, dcol in jobs:
+        for year in FIN_YEARS:
+            lo, hi = '%d-01-01' % year, '%d-12-31' % year
+            frames, last_id, n_page = [], -1, 0
+            try:
+                while True:
+                    d = getattr(tbl, dcol)
+                    df = finance.run_query(query(tbl).filter(
+                        d >= lo, d <= hi, tbl.id > last_id,
+                        tbl.report_type == 0        # ★ 只要合并报表，与全量一致
+                    ).order_by(tbl.id).limit(FIN_PAGE))
+                    if len(df) == 0:
+                        break
+                    frames.append(df)
+                    last_id = int(df['id'].max())
+                    n_page += 1
+                    if len(df) < FIN_PAGE:
+                        break
+                    if n_page > 200:
+                        raise RuntimeError('%s %d 分页超 200 页' % (name, year))
+            except Exception as e:                              # noqa: BLE001
+                print('  [!] %s_%d 抽取失败: %s' % (name, year, str(e)[:80]))
+                continue
+            out = pd.concat(frames, ignore_index=True) if frames else None
+            _save('%s_%d' % (name, year), out)
 
 
 # ---------------------------------------------------------------- 3 事件类

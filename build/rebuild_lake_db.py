@@ -4,13 +4,16 @@
 
 用法:
     python3 datalake/build/rebuild_lake_db.py [--verify]
+    python3 datalake/build/rebuild_lake_db.py --update-baseline
+    python3 datalake/build/rebuild_lake_db.py --update-baseline \
+        --allow-shrink view:dividend_forecast --reason "清掉 11 行垃圾" 
 
 设计:
   · lake.db 只放视图与宏，数据全在 parquet —— 所以重建是幂等的、秒级的
   · 视图有依赖关系，用「反复重试直到无进展」做拓扑排序，不用手写顺序
   · 路径映射按【具体在前、笼统在后】的顺序替换，否则 l0/ 的笼统规则会吃掉 l0/kline
 """
-import io, os, re, sys, json
+import datetime, io, os, re, sys, json
 import duckdb
 
 ROOT   = '/Users/guhao/finacial'
@@ -113,7 +116,13 @@ def main():
     if '--verify' in sys.argv:
         verify()
     if '--update-baseline' in sys.argv:
-        update_baseline()
+        _av = sys.argv
+        _allow, _reason = (), ''
+        if '--allow-shrink' in _av:
+            _allow = tuple(_av[_av.index('--allow-shrink') + 1].split(','))
+        if '--reason' in _av:
+            _reason = _av[_av.index('--reason') + 1]
+        update_baseline(_allow, _reason)
 
 
 def _snapshot():
@@ -142,12 +151,23 @@ def _snapshot():
     return base, cur
 
 
-def update_baseline():
+SHRINK_LOG = os.path.join(ROOT, 'datalake/_backup/baseline_shrinks.jsonl')
+
+
+def update_baseline(allow_shrink=(), reason=''):
     """补完新数据后刷新基线行数。
 
     ★ 护栏：只允许【增加】。行数变小 = 数据丢了，那正是基线该拦住的事 ——
       如果这时候还允许刷新，基线就退化成「橡皮图章」，等于没有。
       语义类（macro / pit）的值必须【完全不变】才放行。
+
+    ★ 唯一的开口：`--allow-shrink <key>[,<key>] --reason "..."`。
+      设计成【必须逐个点名 + 必须给理由】，而不是一个 --force：
+        · 点名 -> 没法顺手放过一个你没注意到的缩水
+        · 理由 -> 追加进 _backup/baseline_shrinks.jsonl，事后能查"为什么少了"
+      真实用例：清掉 stk_fin_forcast 里 11 行垃圾（上游 CSV 引号未闭合导致
+      pandas 静默产出的），124,094 -> 124,083。这是**修数据**不是丢数据，
+      但从行数上看不出区别 —— 所以必须由人说明。
     """
     base, cur = _snapshot()
     grew, shrank, changed_sem = [], [], []
@@ -168,10 +188,33 @@ def update_baseline():
     for k, o, n in grew:
         print('  ↑ %-44s %-12s -> %s  (+%d)' % (k, o, n, n - o))
     if shrank:
-        print('\n❌ 这些行数【变小】了 —— 数据丢失，拒绝刷新基线：')
-        for k, o, n in shrank:
-            print('   %-44s %-12s -> %s  (%d)' % (k, o, n, n - o))
-        sys.exit(1)
+        allow = set(allow_shrink)
+        blocked = [x for x in shrank if x[0] not in allow]
+        okd = [x for x in shrank if x[0] in allow]
+        if blocked:
+            print('\n❌ 这些行数【变小】了 —— 数据丢失，拒绝刷新基线：')
+            for k, o, n in blocked:
+                print('   %-44s %-12s -> %s  (%d)' % (k, o, n, n - o))
+            print('\n   确实是【修数据】而不是丢数据的话，逐个点名并给理由：')
+            print('     --allow-shrink %s --reason "..."'
+                  % ','.join(k for k, _o, _n in blocked))
+            sys.exit(1)
+        if not reason.strip():
+            print('\n❌ --allow-shrink 必须配 --reason "为什么会少" —— '
+                  '没有理由的缩水就是数据丢失')
+            sys.exit(1)
+        print('\n⚠ 已获准的缩水（理由已记入 %s）：'
+              % os.path.relpath(SHRINK_LOG, ROOT))
+        os.makedirs(os.path.dirname(SHRINK_LOG), exist_ok=True)
+        with io.open(SHRINK_LOG, 'a', encoding='utf-8') as f:
+            for k, o, n in okd:
+                print('   ↓ %-44s %-12s -> %s  (%d)' % (k, o, n, n - o))
+                f.write(json.dumps({'ts': datetime.datetime.now()
+                                    .replace(microsecond=0).isoformat(),
+                                    'key': k, 'old': o, 'new': n,
+                                    'delta': n - o, 'reason': reason.strip()},
+                                   ensure_ascii=False) + '\n')
+        grew = grew + okd
     if changed_sem:
         print('\n❌ 语义类基线（macro / pit）变了 —— 拒绝刷新，先查为什么：')
         for k, o, n in changed_sem:

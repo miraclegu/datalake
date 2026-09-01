@@ -338,6 +338,28 @@ python3 datalake/build/rebuild_lake_db.py --verify
 
 ---
 
+## 🔑 三大报表 / 业绩预告的增量语义（2026-09-01 定案）
+
+**三大报表走【整年重抽、整文件替换】，不做行级合并。**
+`extract_jq_financials.py` 本来就按 `report_date` 年份分片存
+`income_YYYY.csv.gz` 等，而 `load_jq_financials.py` glob 全部年份文件重建
+parquet —— 所以换掉当年那几个文件、重跑 loader 就是完整刷新。没有合并，
+就没有「缺列 / 类型错位 / 去重键选错」那一类风险。
+
+抽取侧两个必须一致的点（不一致**不会报错**）：
+- 源必须是 `finance.STK_INCOME_STATEMENT` 等，**不是**
+  `get_fundamentals(query(income))` —— 两者 schema 不同
+- 必须带 `report_type == 0`（只要合并报表）—— 漏掉会把母公司报表一起拉进来，
+  行数翻倍、两种口径混在一张表里
+
+替换侧的护栏：**新文件行数 < 旧的 95% 直接拒绝**。整年重抽本该 >= 旧的
+（重述只会增行），缩水多半是抽取中断或配额耗尽给出的"看着正常的小文件"。
+
+**业绩预告的 CSV 是上游写坏的**，必须用 `build/csv_repair.py` 读 ——
+细节与三个解析器的分歧见 `docs/数据字典/4-按陷阱索引.md` B 节。
+
+---
+
 ## 🔑 tdx.db 各表的更新语义（决定要不要留切片）
 
 `tdx.db` 是采集工作库，**不同表的更新方式不同** —— 混在一起处理必然出错。

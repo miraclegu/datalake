@@ -261,18 +261,31 @@ def main():
         print('  未抽取, 跳过（只有 1 处策略引用, 可选）')
     else:
         fp = os.path.join(L0, 'stk_fin_forcast.parquet')
-        # content 字段是大段中文预告正文, 内含换行。CSV 本身是合规的(多行字段已加引号),
-        # 但 DuckDB 的 read_csv_auto 在这种多行引用字段上探测失败。
-        # 走 pandas 读(文件就是 pandas 写的, 能原样往返), **不用 ignore_errors** ——
-        # 那会静默丢行且丢多少都不知道, 正是这个库最要避免的那类"假成功"。
-        import pandas as pd
-        fdf = pd.read_csv(fc, dtype=str, encoding='utf-8-sig')
+        # 🔴 这个 CSV 是【上游写坏的】：content 是大段中文正文，含换行、
+        #   含千分位逗号，且有 10 条记录引号未闭合。三个解析器给三个答案，
+        #   其中两个**不报错**：
+        #     csv.reader  50,650 行（从未闭合的引号处开始串行）
+        #     pandas     124,094 行（静默产出 11 行垃圾：id 列装着正文碎片）
+        #     DuckDB     直接报 state machine invalid
+        #   权威条数是 124,083（build/csv_repair.py 按记录头判据切 + 内容校验）。
+        #
+        # ★ 原实现用 pandas 读，且只校验「落盘行数 == 读入行数」——
+        #   两边一样错，检查照样通过，于是 11 行垃圾静默进库并存活了一周。
+        #   **行数对上不等于读对了。** 现在改成校验【内容】。
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from csv_repair import read_forcast_df
+        fdf, _st = read_forcast_df(fc)
         con.register('_fc', fdf)
         con.execute("COPY (SELECT * FROM _fc) TO '%s' (FORMAT parquet, COMPRESSION zstd)" % fp)
         con.unregister('_fc')
-        # 落盘行数必须等于 pandas 读到的行数, 不等就是丢了行
         _n = con.execute("SELECT count(*) FROM read_parquet('%s')" % fp).fetchone()[0]
         check(_n == len(fdf), '预告落盘 %s 行 = 读入行数' % format(_n, ','))
+        # 内容校验（读侧已经抛错了，这里再核一遍落盘结果，防写入环节出错）
+        _bad = con.execute(
+            "SELECT count(*) FROM read_parquet('%s') "
+            "WHERE try_cast(id AS BIGINT) IS NULL "
+            "   OR NOT regexp_matches(code, '^[0-9]{6}[.]XSH[EG]$')" % fp).fetchone()[0]
+        check(_bad == 0, '预告无垃圾行（id 全数字、code 全合法）')
         del fdf
         con.execute(
             "CREATE OR REPLACE VIEW dividend_forecast AS SELECT * FROM read_parquet('%s')" % fp)
