@@ -128,7 +128,30 @@ INDEXES = {'000300.XSHG': 'in_hs300', '000905.XSHG': 'in_zz500',
 #    所以：**推导表要完整（含全部报告期），去重只属于 as-of 那一步。**
 #    现在 _fin 不去重、不做单调过滤；ASOF 用单独的 _fin3_asof。
 
-# 成交量单位陷阱：tdx 原始 volume 字段的值是【股数 × 100】。
+# 🔴🔴 成交量单位陷阱（2026-09-04 修正：它**不是全历史统一的**）
+#
+#   原先这里写的是「tdx 原始 volume 的值是股数 × 100」—— 那条**只对近期成立**。
+#   实测（判据：均价 = amount/volume_shares 必须落在当日 [low, high] 内）：
+#
+#     volume/100 均价在区间内   13,572,591 行 (83.5%)  ✓ volume = 股×100
+#     volume/100 均价【偏低】    2,605,904 行 (16.0%)  🔴 volume = 股×10000
+#
+#   也就是说**早期的 volume 比近期又多乘了 100**。表现是 2005 年中位换手率
+#   94.96%、2008 年 167.11% —— 数字荒谬却**不报错**，而 2011 年后完全正常，
+#   所以只看近期数据（当初就是这么验的）永远发现不了。
+#
+#   🔴 切换**不是全市场同一天完成的**：多数票在 2010-09-14 切换，但万科A、
+#     宝钛股份等 24 只一直到 2011-07 之后才切 —— 所以**按日期修是错的**，
+#     必须逐行判据。
+#   ★ 分布是干净的双峰（≈1 与 ≈100 之间只有 5 行落在中间），所以逐行判据安全。
+#
+#   判据用 **amount 与 [low, high]**，不用日期、也不用 turnover：
+#   amount 是元、low/high 是元，元对元，与 volume 的单位无关（同 feed.py
+#   "用 amount 元对元，绕开单位陷阱"那条）。
+#
+#   turnover 同源（tdx 用同一个 volume 算的），所以**共用同一个 flag**。
+#
+# 成交量单位陷阱（近期那一段）：tdx 原始 volume 字段的值是【股数 × 100】。
 #   交叉验证：volume/100 算换手率得 0.4731，面板 turnover 列 0.473107，精确吻合；
 #   茅台 2024-06-28 volume/100 = 3,858,202 股，与 amount/close 推得的 3,884,878 股
 #   相符（差 0.7% 来自收盘价 vs 均价）。日成交 200~400 万股正是茅台的量级。
@@ -168,6 +191,36 @@ LIMIT_PCT_TMPL = (
     " WHEN s.public_status IN ({st}) AND c.date >= DATE '{st10}' THEN 0.10"
     " WHEN s.public_status IN ({st}) THEN 0.05"
     " ELSE 0.10 END")
+
+# 🔴 均价低于当日最低价的【已知坏行】白名单（2026-09-04 定案，20 行）。
+#   用白名单而不是放宽阈值 —— 这样任何【新】案例都会被断言抓到
+#   （同 KNOWN_PRELIST_KLINE 那条原则）。两类：
+#     · r≈0.001~0.11（11 行）：源数据真坏，volume 比"股×10000"还多约 10 倍，
+#       集中在 2006-05~2007-05（其中 2006-07-13 一天就有 6 行）
+#     · r≈0.93~0.99（9 行）：ST 股 1~6 万元的小额成交，volume 存储精度不够
+#   两类都不值得为其再加一档除法：11 行 + 9 行，且全在 2003~2007。
+KNOWN_VWAP_BELOW_LOW = {
+    ('000415.XSHE', '2006-07-13'),
+    ('000613.XSHE', '2007-06-01'),
+    ('000613.XSHE', '2007-06-04'),
+    ('000613.XSHE', '2007-06-06'),
+    ('000613.XSHE', '2007-06-11'),
+    ('000657.XSHE', '2006-07-13'),
+    ('000788.XSHE', '2006-07-13'),
+    ('000985.XSHE', '2006-07-13'),
+    ('002051.XSHE', '2006-07-13'),
+    ('600131.XSHG', '2006-05-31'),
+    ('600522.XSHG', '2006-07-13'),
+    ('600582.XSHG', '2006-09-12'),
+    ('600613.XSHG', '2003-05-13'),
+    ('600733.XSHG', '2006-07-13'),
+    ('600759.XSHG', '2007-05-21'),
+    ('600759.XSHG', '2007-05-22'),
+    ('600759.XSHG', '2007-05-23'),
+    ('600961.XSHG', '2006-05-19'),
+    ('600963.XSHG', '2007-05-24'),
+    ('600981.XSHG', '2006-06-27'),
+}
 
 FAILURES = []
 def check(cond, msg):
@@ -426,11 +479,23 @@ def build_year(con, y):
     SELECT
         c.date, c.jq_code, c.symbol,
         c.close_bfq, c.open, c.high, c.low,
-        c.volume / 100 AS volume_shares,   -- 单位见文件头；原始值只留在 raw 层
+        -- 🔴 逐行判据（见文件头）：均价 = amount/(volume/100) 若【低于当日最低价】，
+        --   说明这一行的 volume 又多乘了 100（早期数据），再除 100。
+        --   用 0.99 留一点容差；实测双峰之间只有 5 行，边界不模糊。
+        CASE WHEN c.low > 0 AND c.volume > 0 AND c.amount > 0
+              AND c.amount / (c.volume / 100.0) < c.low * 0.99
+             THEN c.volume / 10000.0 ELSE c.volume / 100.0
+        END AS volume_shares,
         c.amount,
         c.close_hfq, c.hfq_factor,
         CASE WHEN c.prev_hfq > 0 THEN c.close_hfq / c.prev_hfq - 1 END AS ret_1d,
-        b.preclose, b.change_pct, b.amplitude, b.turnover,
+        b.preclose, b.change_pct, b.amplitude,
+        -- turnover 与 volume 同源（tdx 用同一个 volume 算的）——【同一个 flag】。
+        -- 不给它单独判据：两处判据迟早分叉，而"换手率和成交量对不上"不报错。
+        CASE WHEN c.low > 0 AND c.volume > 0 AND c.amount > 0
+              AND c.amount / (c.volume / 100.0) < c.low * 0.99
+             THEN b.turnover / 100.0 ELSE b.turnover
+        END AS turnover,
         -- ★ 市值为 0 是【缺失值伪装成极值】，不是真值：300114.XSHE 有真实价格
         --   与成交量却 floatmv=totalmv=0（tdx 股本数据缺失）。按市值【升序】选股时
         --   0 永远排第一 —— 实测它从 2016 年起 2056 个交易日一直霸占 v0b 候选池首位，
@@ -707,6 +772,50 @@ def verify(con):
     # 5) 收益率无异常
     o = con.execute('SELECT count(*) FROM %s WHERE abs(ret_1d) > 0.45' % P).fetchone()[0]
     check(o < n * 0.0001, 'ret_1d 超 ±45%% 的行 %d (< %.0f)' % (o, n * 0.0001))
+
+    # 5a) 🔴🔴 成交量单位：均价必须落在当日 [low, high] 内
+    #   判据是元对元（amount 与 low/high 都是元），与 volume 的单位无关。
+    #   守的是"早期 volume 又多乘了 100"那个坑（见文件头）——
+    #   2026-09-04 之前面板里有 2,605,904 行（16%）没修，
+    #   表现是 2005 年中位换手率 94.96%，**荒谬却不报错**。
+    r = con.execute("""SELECT
+            count(*) AS n,
+            sum(CASE WHEN amount / volume_shares < low * 0.99 THEN 1 ELSE 0 END) AS lo,
+            sum(CASE WHEN amount / volume_shares > high * 1.01 THEN 1 ELSE 0 END) AS hi
+        FROM %s WHERE volume_shares > 0 AND amount > 0 AND low > 0""" % P).fetchone()
+    #   ★ 门槛 amount > 1 万元：1 手都不到的成交，vwap 的精度本就不够
+    #     （实测 328 行、占 0.002%，源数据里 volume 存的就是 1,021,300
+    #     而不是 1,000,000，2% 的舍入就能触发判据）。这是物理边界，不是放宽阈值。
+    bad = [(a, d) for a, d, v, lo_, hi_ in
+           con.execute("""SELECT jq_code, CAST(date AS VARCHAR) AS d,
+               amount / volume_shares AS vwap, low, high
+        FROM %s WHERE volume_shares > 0 AND amount > 10000 AND low > 0
+          AND amount / volume_shares < low * 0.99""" % P).fetchall()
+           if (a, d) not in KNOWN_VWAP_BELOW_LOW]
+    check(not bad,
+          '均价 >= 当日最低价（成交量单位正确）—— 白名单外 %d 行 %s'
+          % (len(bad), (bad[:5] if bad else '')))
+    print('    [信息] 均价低于最低价：全部 %s 行；其中成交额>1万的 %d 行'
+          '（%d 行在白名单，%d 行是新的）'
+          % (format(r[1], ','), len(bad) + len(KNOWN_VWAP_BELOW_LOW),
+             len(KNOWN_VWAP_BELOW_LOW), len(bad)))
+    # ⚠️ 偏高的那一批是【另一个问题】：amount 偏大（实测 74,963 行，0.46%，
+    #   集中在 2020~2026）。用第三方判据 turnover 反算股数验证过：
+    #   volume_shares 是对的、amount 不对。**没修**，先看住不让它扩大。
+    check(r[2] <= max(90000, r[0] * 0.006),
+          '均价 <= 当日最高价 —— 偏高 %s 行 (%.4f%%)，已知 amount 偏大那批'
+          % (format(r[2], ','), 100.0 * r[2] / max(r[0], 1)))
+
+    # 5a2) 换手率的量级：中位数必须像换手率
+    #   🔴 turnover 与 volume 同源，上面那个坑会让它同步错 100 倍 ——
+    #     2005 年中位 94.96、2008 年 167.11（换手率 167%？）。
+    #     按【年】查而不是整体查：整体中位会被 1300 万行正常数据淹掉。
+    bad = con.execute("""SELECT year(date) AS y, median(turnover) AS m
+        FROM %s WHERE turnover IS NOT NULL AND turnover > 0
+          AND public_status IN ('正常上市','ST','*ST')
+        GROUP BY 1 HAVING median(turnover) > 20 ORDER BY 1""" % P).fetchall()
+    check(not bad, '各年 turnover 中位 <= 20%%（换手率量级）—— 异常年份: %s'
+          % (', '.join('%s=%.1f' % (a, b) for a, b in bad) or '无'))
 
     # 5b) 🔴 PIT: 不应有上市日之前的行情（已知代码复用案例走白名单）
     rows = con.execute('''SELECT jq_code, count(*) FROM %s WHERE listed_days < 0
