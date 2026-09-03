@@ -27,6 +27,7 @@ import argparse
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -300,6 +301,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('tar')
     ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--and-load', action='store_true', help=(
+        '合并完【接着把该跑的 loader 全跑一遍】。'
+        '看板的"上传财务数据"走这条 —— 顺序在 LOADERS 里，只此一处；'
+        '让人对着打印出来的命令手抄，抄漏一条就是 raw 与 std 不一致，'
+        '而那不会报错。'))
     a = ap.parse_args()
     if not os.path.exists(a.tar):
         print('找不到 %s' % a.tar)
@@ -307,7 +313,13 @@ def main():
 
     tmpd = tempfile.mkdtemp(prefix='jqinc_')
     with tarfile.open(a.tar) as t:
-        t.extractall(tmpd)
+        # ★ filter='data'：拒绝绝对路径 / .. / 设备文件等。Python 3.14 起
+        #   不传这个参数会直接拒解包（3.12+ 已警告）。而且包是上传来的 ——
+        #   "自己导出的所以安全"不是理由，这一行几乎没成本。
+        try:
+            t.extractall(tmpd, filter='data')
+        except TypeError:                   # Python < 3.12 没有 filter
+            t.extractall(tmpd)
     # 增量包里是 .csv.gz（聚宽研究环境没有 pyarrow，见 extract 脚本的环境约束）。
     # 兼容 .parquet 是为了以后环境变了不用改这里。
     incs = sorted(f for f in os.listdir(tmpd)
@@ -373,20 +385,48 @@ def main():
         return 0
     print('✅ 合并完成，有变化的：%s' % touched)
     print()
-    print('接下来按顺序跑（旧文件已备份成 *.bak）：')
     seen = []
     for stem, script in LOADERS:
         if stem in touched and script not in seen:
             seen.append(script)
-    for s in seen:
-        print('    python3 %s' % s)
-    print('    python3 datalake/build/rebuild_lake_db.py --verify')
-    print('    python3 datalake/build/build_panel_daily.py            # 不要加 --verify！')
-    print('    python3 datalake/build/build_panel_daily.py --verify')
-    print('    python3 datalake/build/build_beta_daily.py')
+    # ★ 收尾这几步是【固定的】：raw 变了 -> lake.db -> 面板 -> beta。
+    #   ⚠ build_panel_daily.py 的 --verify 是"只校验不构建"，与
+    #     rebuild_lake_db.py 的"构建后校验"语义相反 —— 所以面板要跑两次
+    #     （先不带 --verify 构建，再带 --verify 校验）。别合成一条。
+    tail = [['python3', 'datalake/build/rebuild_lake_db.py', '--verify'],
+            ['python3', 'datalake/build/build_panel_daily.py'],
+            ['python3', 'datalake/build/build_panel_daily.py', '--verify'],
+            ['python3', 'datalake/build/build_beta_daily.py']]
+    chain = [['python3'] + s.split() for s in seen] + tail
+    if not a.and_load:
+        print('接下来按顺序跑（旧文件已备份成 *.bak）：')
+        for c in chain:
+            print('    %s' % ' '.join(c))
+        print()
+        print('[!] build_panel_daily.py 的 --verify 是【只校验不构建】，')
+        print('    与 rebuild_lake_db.py 的「构建后校验」语义相反 —— 别混。')
+        print('[!] 想让它自己跑完：加 --and-load')
+        return 0
+
+    print('=' * 74)
+    print('--and-load：接着跑 %d 步' % len(chain))
+    print('=' * 74)
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    for i, c in enumerate(chain, 1):
+        print()
+        print('--- [%d/%d] %s' % (i, len(chain), ' '.join(c)))
+        sys.stdout.flush()
+        rc = subprocess.call(c, cwd=root)
+        if rc != 0:
+            # ★ 中断而不是继续：后面每一步都吃前一步的产物，
+            #   带着坏数据往下跑会把错误传播到面板，而面板不报错。
+            print()
+            print('❌ 第 %d 步失败（返回码 %d），**就此中断**。' % (i, rc))
+            print('   前面的步骤已生效；修好之后从这一步继续手动跑即可。')
+            return 1
     print()
-    print('[!] build_panel_daily.py 的 --verify 是【只校验不构建】，')
-    print('    与 rebuild_lake_db.py 的「构建后校验」语义相反 —— 别混。')
+    print('✅ 全部完成：合并 + %d 个 loader + lake.db + 面板 + beta' % len(seen))
     return 0
 
 
