@@ -14,7 +14,7 @@
   · DuckDB 的 `read_csv_auto` 直接报 "state machine reached an invalid state"，
     而 merge 脚本的 per-file try/except 把整张表跳过
 
-按「物理行以 `<数字>,` 开头」切，权威记录数是 **124,088**。
+按「物理行以 `<数字>,` 开头」切，权威记录数是 **124,083**。
 
 ## 三个都很隐蔽的教训
 
@@ -81,7 +81,7 @@ def read_repaired(path, encoding='utf-8-sig', n_head=15):
 
     这个切法的正确性不是靠假设，而是靠**内容校验**证明的：
     每条记录都要满足 id 是纯数字、code 形如 NNNNNN.XSHE/G、end_date 与
-    pub_date 是日期。124,088 条全部通过才算切法成立（见 read_forcast_df）。
+    pub_date 是日期。124,083 条全部通过才算切法成立（见 read_forcast_df）。
     """
     header, recs, joined = split_records(path, encoding)
     hdr = next(csv.reader([header]))
