@@ -465,18 +465,84 @@ WHERE m.class = 'stock'          -- ← 少了这行就错
 **净数据约 1.14 GB**（kline + basic + factor + snapshots + financials）——
 其余都是"可重建"或"同源的另一种格式"。
 
-### 🔴 三样东西丢了补不回来
+### 一键装配：`setup_tdx.py`
+
+换台机器（或换个操作系统）把 tdx 链装回来，**一个 Python 文件**：
+
+```bash
+python3 datalake/setup_tdx.py                 # 只体检，什么都不改
+python3 datalake/setup_tdx.py --install       # 装/升级 tdx2db（按本机 OS 选包）
+python3 datalake/setup_tdx.py --bootstrap     # 从零：下 548 MB 全量包 -> init
+python3 datalake/setup_tdx.py --sync          # 跑一次增量（= sync_daily.sh 的 1/6）
+python3 datalake/setup_tdx.py --install-timer # 挂每日定时（launchd/systemd/schtasks）
+```
+
+**为什么不是 .sh + .ps1 两份**：命令确实分 OS（tar vs Expand-Archive、
+launchd vs systemd vs schtasks），但**判据只有一套** —— 装哪个包、装完怎么验、
+init 之后行数许不许缩。两份必然分叉，而分叉那份跑出来的结果看着正常。
+OS 差异收在几张表里（`ASSETS` / `_install_timer_*`），判据只写一遍。
+
+#### 🔴 四个与"网上文档"不一致的实测事实（2026-09-03 核过）
+
+| 文档常写 | 实测 |
+|---|---|
+| `pip install tdx2db` | 🔴 **PyPI 上那个是同名的另一个项目**（`xbfighting/tdx2db` 0.5.0，只支持 PostgreSQL/MySQL/SQLite，**没有 DuckDB**）。我们用的是 Go 写的 **`github.com/jing2uo/tdx2db`**（395 star，从二进制符号 `github.com/jing2uo/tdx2db/database/clickhouse` 确认）。pip 装上去"看着成功"，然后 CLI 对不上、DuckDB 用不了 |
+| `--dbpath tdx.db` | 实参是 **`--dburi 'duckdb://./tdx.db'`** |
+| `--minline 1,5` | 实参是 **`--min`（布尔）** |
+| 三个分市场包 `shlday/szlday/bjlday.zip` | 现在是**沪深京合一** `hsjday.zip`（**548 MB**，`https://data.tdx.com.cn/vipdoc/hsjday.zip`）。老的三个仍可用（沪市 230 MB） |
+
+release 只有四个平台：`Darwin_arm64` / `Linux_arm64` / `Linux_x86_64` /
+`Windows_x86_64` —— 🔴 **没有 `Darwin_x86_64`**，Intel Mac 要自己 `go build`，
+脚本会响亮报错而不是装一个跑不了的包。
+
+#### 🔴 升级 tdx2db 会让现有 `tdx.db` 不兼容
+
+2026-09-03 实测：本机 v2026.5 建的库是 `_meta.schema_version = 5.0`，
+而最新 v2026.8.12 要 6.x。装上新版后 `cron` 直接
+`🛑 数据库 schema 版本不兼容 (当前库: v5.x, 需要: v6.x)`。
+
+★ 它**响亮报错且没碰数据**（跑完四张表行数逐一相同）—— 静默写坏才是灾难。
+但升级的代价是**整库重建**（548 MB + 全量 init），而 release notes 是空的、
+没有迁移脚本。
+
+所以 `--install` 有护栏：新二进制先下到临时目录，造一个**只含 `_meta` 一张表**
+的一次性小库去问它认不认，报不兼容就**拒绝安装**（退出码 3）并说清代价。
+🔴 **不拿生产库去试探** —— "这次没写坏"是这一版的行为、不是契约。
+★ tag 里看不出它要哪个 schema，所以只能问；硬编码"版本 → schema"的表
+只会在下一个 release 过期。
+
+#### 🔴 定时任务必须显式带 PATH
+
+`launchd` / `systemd` 的默认环境很窄，`python3` 会解析到**系统那个**
+（没装 duckdb）—— 表现是 `sync_daily.sh` 的
+`2/6 PIT 快照 ModuleNotFoundError: No module named 'duckdb'`，
+**而那一步漏一天不可逆，失败只写在 launchd 的日志里，第二天你不会看到**。
+
+2026-09-03 真踩过：重新生成 plist 时漏抄了原正本里的 `EnvironmentVariables`，
+当晚手动触发就炸在这一步（当天 18:10 那次用的还是老 plist，6/6 成功，
+所以没有真实损失）。
+
+判据用 **`sys.executable` 的目录**放 PATH 最前，不硬编码 `/opt/homebrew/bin`
+—— 后者只在这台机器上对，而这个文件的全部意义就是换机器也能用。
+★ `--install-timer` 装完会**用那份 PATH 真跑一次 `import duckdb`** 自证 ——
+"plist 写出去了"不等于"到点跑得起来"。
+
+### 🔴 两样东西丢了补不回来
 
 1. **`raw/tdx/snapshots`（1 MB）** —— tdx 的名称/分类/板块成分是 **type-1
    覆盖写**，`daily_snapshot.py` 每天切一片。**漏一天永久丢失**，
    通达信只给当前状态。体积最小、最该备份。
-2. **`tdx2db`（60 MB Go 二进制）** —— `sync_daily.sh` 第 1/6 步靠它，
-   而**仓库内外都找不到 `.go` 源码或 `go.mod`**。它 gitignore 掉是对的
-   （编译产物不进版本控制），但**必须进备份**。
-3. **`tdx.db` + 冻结 parquet 里的退市股** —— `vipdoc/` 已清空，
+2. **`tdx.db` + 冻结 parquet 里的退市股** —— `vipdoc/` 已清空，
    而 kline 里有 **2,191 个 2026 年后再无数据的代码**（已摘牌）。
-   ⚠️ 通达信当前的 `vipdoc` zip **是否仍含这些已摘牌代码，没有验证过** ——
+   ⚠️ `hsjday.zip` **是否仍含这些已摘牌代码，没有验证过** ——
    所以不要假设"重新下载就能补回来"。
+   ★ 这也是 `--bootstrap` 带缩表护栏的原因：init 先落到 `tdx.db.new`，
+   逐项对账（行数/代码数/最早日），**任一项缩了就拒绝替换**。
+   要缩得显式写 `--allow-shrink`。
+
+★ **`tdx2db` 那个 60 MB 二进制不再算"不可重建"** —— `--install` 能从
+GitHub release 装回来（本机版本记在 `raw/tdx/_ingest/tdx2db.version.json`）。
+但注意上面那条：装回来的是**新版**，而新版不认旧库。
 
 ### `raw/hf`（1.53 GB）已不接同步链
 
