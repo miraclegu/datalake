@@ -33,6 +33,26 @@
 4. **全量包是 `hsjday.zip`（548 MB，沪深京日线合一）**，不是老 README 里
    那三个分市场的 `shlday/szlday/bjlday.zip`（后者仍可用，沪市 230 MB）。
 
+## 🔴 `hsjday.zip` 里的路径是 Windows 反斜杠 —— Python 解压不出目录树
+
+2026-09-03 实测：`hsjday.zip` 的 **12,392 个条目全部**长这样
+
+    sh + 反斜杠 + lday + 反斜杠 + sh000001.day    零个目录条目
+
+Python 的 `zipfile` 按 ZIP 规范把反斜杠当**普通字符**，所以 `extractall`
+出来是**平坦的、文件名里带反斜杠的 12,392 个文件**，而不是
+`vipdoc/sh/lday/*.day` 的目录树。tdx2db 于是一个文件都扫不到，报
+
+    🛑 failed to import stock csv: IO Error: No files found that match
+       the pattern ".../tdx2db-temp-*/stock.csv"
+
+—— 这个报错**完全指不到"路径分隔符"这件事上**（它在抱怨自己的中间文件）。
+
+★ 讽刺的是命令行 `unzip -q hsjday.zip -d vipdoc` 是对的（unzip 会把反斜杠
+  转成 `/`），但 Windows 上没有 unzip —— 而这个文件的意义就是跨 OS。
+  所以 `_extract_zip` 自己把反斜杠归一成 `/` 再建目录，顺手防路径穿越
+  （`..` / 绝对路径一律拒 —— `extractall` 的老 CVE 就是这个）。
+
 ## 🔴 升级 tdx2db 会让现有 `tdx.db` 不兼容 —— 所以 `--install` 有护栏
 
 2026-09-03 实测：本机 v2026.5 建的库是 `_meta.schema_version = 5.0`，
@@ -54,6 +74,50 @@
   一次性小库让这件事跟运气无关。
 ★ tag（`v2026.8.12`）里看不出它要哪个 schema，所以只能问它 ——
   硬编码一张"版本 -> schema"的表只会在下一个 release 过期。
+
+## 🔴 `init` 只导日线 —— 复权因子与基础面要靠紧跟的 `cron`
+
+2026-09-03 实测：`init --dayfiledir vipdoc` 跑完自报"🚀 股票数据导入成功 /
+初始化完成"，但
+
+    raw_adjust_factor    23,525,905 -> 0      整张表空
+    raw_basic_daily      23,525,905 -> 0      整张表空
+
+因为**复权因子要 gbbq（股本变迁）**，而 gbbq 不在 `hsjday.zip` 里。
+`tdx2db` 自己会下它（二进制里有
+`http://www.tdx.com.cn/products/data/data/dbf/gbbq.zip`），但那是在
+**`cron`** 里 —— 紧跟一次 `cron` 之后：
+
+    🐢 开始下载股本变迁数据 / 📈 股本变迁数据导入成功
+    📟 计算股票基础行情 -> 🔢 基础行情导入成功
+    📟 计算股票复权因子 -> 🔢 复权因子导入成功
+    raw_adjust_factor / raw_basic_daily  0 -> 22,057,837
+
+所以 `--bootstrap` = **init 然后 cron**，对账放在 cron 之后做。
+★ `init` "成功"了但两张表是空的 —— 这就是为什么对账不能只看"命令退出码 0"。
+
+## 🔴 已摘牌的股票补不回来（2026-09-03 实测定案）
+
+`hsjday.zip` 只有 12,392 个 `.day`，而旧库有 43,401 个代码。对账（init+cron）：
+
+| | 旧 | 新 | 差 |
+|---|---|---|---|
+| `raw_kline_daily` | 36,320,978 | 29,622,428 | −670 万行 |
+| `raw_symbol_class` | 43,401 | 12,389 | −31,012 |
+| **A 股代码（60/00/30/68）** | **5,925** | **5,886** | **−39 只** |
+| `raw_adjust_factor` | 23,525,905 | 22,057,837 | −147 万 |
+| `raw_gbbq` | 205,328 | 205,372 | **+44**（更新了） |
+
+拆开看：
+- 少的 31,012 里 **22,016 个债券 + 6,811 个基金**，本项目用不到（panel 只做股票）
+- **指数/板块 2,431 个是齐的** —— `hsjday.zip` 含指数，不需要另下 `tdxzs_day.zip`
+- 🔴 少的股票**全部是已摘牌的**：最后交易于 1997~2021 年，
+  2026-06 之后还在交易的 **0 只** —— 所以缩水不影响"今天能买什么"，
+  但**影响回测的历史宇宙**（幸存者偏差）
+
+**结论：全量包不含已摘牌代码，这一点现在是实测定案，不再是"没验证过"。**
+所以 `--bootstrap` 只适合**从零装机**；已有库的机器不要跑它
+（会用 5,886 只的宇宙换掉 5,925 只的）。
 
 ## 🔴 `init` 是全量覆盖 —— 所以有缩表保护
 
@@ -320,6 +384,36 @@ def _unpack(pkg, dst, asset):
     return None
 
 
+def _extract_zip(zp, dest):
+    """解 zip，**把 Windows 反斜杠归一成目录分隔符**。
+
+    🔴 `hsjday.zip` 里 12,392 个条目的分隔符全是**反斜杠**、
+      零个目录条目。Python 的 `zipfile` 按规范把反斜杠当普通字符，
+      `extractall` 会给出一堆平坦的怪文件名，而 tdx2db 要的是目录树 ——
+      它扫不到文件，报的却是"我的中间文件 stock.csv 不存在"，
+      **那个报错指不到真正的原因**。
+
+    ★ 顺手防路径穿越：`..` 与绝对路径一律拒（`extractall` 的老问题）。
+    返回落盘的文件数。
+    """
+    n = 0
+    with zipfile.ZipFile(zp) as z:
+        for i in z.infolist():
+            name = i.filename.replace('\\', '/')
+            if i.is_dir() or name.endswith('/'):
+                continue
+            parts = [x for x in name.split('/') if x not in ('', '.')]
+            if any(x == '..' for x in parts) or name.startswith('/'):
+                raise SystemExit('🔴 zip 里有可疑路径，拒绝解压：%r'
+                                 % i.filename)
+            out = os.path.join(dest, *parts)
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with z.open(i) as src, open(out, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+            n += 1
+    return n
+
+
 def _probe_schema(newbin, have):
     """新二进制认不认 `schema_version = have` 的库？
 
@@ -466,11 +560,27 @@ def bootstrap(allow_shrink=False, keep_zip=False, reuse_vipdoc=False):
             if bad:
                 raise SystemExit('🔴 zip 坏在 %s —— 删掉重下' % bad)
             n = len(z.namelist())
-        _say('  %d 个文件，解到 %s' % (n, VIPDOC))
+        _say('  %d 个条目，解到 %s' % (n, VIPDOC))
         shutil.rmtree(VIPDOC, ignore_errors=True)
         os.makedirs(VIPDOC, exist_ok=True)
-        with zipfile.ZipFile(zp) as z:
-            z.extractall(VIPDOC)
+        got = _extract_zip(zp, VIPDOC)
+        # 🔴 自证：解出来必须是【目录树】而不是一堆带反斜杠的平坦文件。
+        #   不验的话，下一步 init 报的是"我的中间文件不存在"，
+        #   而那个报错指不到路径分隔符这件事上（已踩，见模块 docstring）。
+        days = sum(len([f for f in fs if f.endswith('.day')])
+                   for _, _, fs in os.walk(VIPDOC))
+        subs = [d for d in os.listdir(VIPDOC)
+                if os.path.isdir(os.path.join(VIPDOC, d))]
+        _say('  落盘 %d 个文件，其中 .day %d 个，子目录 %s'
+             % (got, days, sorted(subs) or '（没有！）'))
+        if not days or not subs:
+            raise SystemExit(
+                '🔴 解压后没有目录树（.day %d 个 / 子目录 %d 个）——'
+                ' tdx2db 会扫不到任何文件。'
+                '\n   zip 里的条目名可能又换写法了，查一眼：'
+                '\n   python3 -c "import zipfile;'
+                'print(zipfile.ZipFile(%r).namelist()[:3])"' % (
+                    days, len(subs), zp))
         if not keep_zip:
             os.remove(zp)
 
@@ -483,7 +593,19 @@ def bootstrap(allow_shrink=False, keep_zip=False, reuse_vipdoc=False):
     _say('\n全量导入（init）—— 这一步比较久')
     _run([BIN, 'init', '--dburi', 'duckdb://./%s' % os.path.basename(new),
           '--dayfiledir', VIPDOC], cwd=TDX)
+    # 🔴 init 只导日线！复权因子与基础面要靠紧跟的 cron（它自己去下 gbbq）——
+    #   不跑这一步的话 raw_adjust_factor / raw_basic_daily 是**空表**，
+    #   而 init 自己会报"导入成功"。实测踩过，见模块 docstring。
+    _say('\n补 gbbq / 复权因子 / 基础行情（cron）')
+    _run([BIN, 'cron', '--dburi', 'duckdb://./%s' % os.path.basename(new)],
+         cwd=TDX)
     after = _db_stats(new)
+    # 自证：这两张表不许是空的（空表下游算不出后复权，而回测吃的是它）
+    for t in ('raw_adjust_factor', 'raw_basic_daily'):
+        if not (after.get(t) or {}).get('rows'):
+            raise SystemExit(
+                '🔴 %s 是空表 —— cron 那一步没生效（gbbq 没下下来？）。'
+                '\n   新库留在 %s，别拿它替换。' % (t, _rel(new)))
     if not after or 'error' in after:
         raise SystemExit('🔴 新库读不出来：%s' % after)
 
@@ -513,9 +635,14 @@ def bootstrap(allow_shrink=False, keep_zip=False, reuse_vipdoc=False):
                 shrink.append((t, '最早日', b['first'], a['first']))
         if shrink and not allow_shrink:
             _say('\n🔴 拒绝替换 —— 有 %d 项缩了。' % len(shrink))
-            _say('   最可能的原因：全量包**不含已摘牌代码**，而旧库里有'
-                 '（本机实测 2,191 个 2026 年后再无数据的代码）。')
-            _say('   缩水后的宇宙跑回测会有幸存者偏差，**而它不报错**。')
+            _say('   原因已实测定案（2026-09-03）：`hsjday.zip` **不含已摘牌'
+                 '代码**。少掉的绝大部分是债券/基金（本项目用不到），')
+            _say('   但 A 股也少 39 只 —— 全是 1997~2021 年摘牌的，'
+                 '2026-06 后还在交易的 0 只。')
+            _say('   不影响"今天能买什么"，但**影响回测的历史宇宙**'
+                 '（幸存者偏差），而它不报错。')
+            _say('   -> 已有库的机器**不要**拿它替换；'
+                 '`--bootstrap` 是给从零装机用的。')
             _say('   新库留在 %s，自己比对完确认要用就加 --allow-shrink。'
                  % os.path.relpath(new, REPO))
             return 2
