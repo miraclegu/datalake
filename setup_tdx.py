@@ -119,6 +119,29 @@ Python 的 `zipfile` 按 ZIP 规范把反斜杠当**普通字符**，所以 `ext
 所以 `--bootstrap` 只适合**从零装机**；已有库的机器不要跑它
 （会用 5,886 只的宇宙换掉 5,925 只的）。
 
+## 🔴🔴 `--bootstrap` 会让 `turnover` 全程差 100 倍 —— 缩表护栏拦不住
+
+2026-09-03 实测（v2026.5 vs v2026.8.12、生产库 vs hsjday.zip 新建，三方对比）：
+
+**通达信改过 `.day` 里 `volume` 的单位。** 同一 (symbol, date)：
+
+    生产库（老 vipdoc 多年累积）  volume = 真实股数 × 100
+    新库（hsjday.zip 现在下的）    volume = 真实股数        ← 差 100 倍
+
+而 `turnover` 是 tdx2db 用 `volume / 流通股数` **算**出来的，所以：
+
+    生产库  turnover = 百分数（2026 年中位 1.95，即 1.95%）
+    新库    turnover = 小数  （同期约 0.0195）
+
+`load_tdx_kline.py` 把 `raw_basic_daily` **原样**拷进 `raw/tdx/basic`，
+`build_panel_daily.py` 直接取 `b.turnover` —— 所以**重建一次，面板的
+turnover 就从百分数变成小数，全程差 100 倍**。换手榜、`sgmspeg` 的
+`turnover_volatility` 全都会静默错 100 倍。
+
+🔴 **缩表护栏拦不住它**：行数一行不少，是**值**变了。所以另加一条
+**口径护栏**（`_check_scale`）：拿两边重叠的最近一段比 `turnover` 中位数，
+比值偏离 1 超过 5 倍就拒绝替换。要绕过同样得显式 `--allow-shrink`。
+
 ## 🔴 `init` 是全量覆盖 —— 所以有缩表保护
 
 现有 `tdx.db` 里有 **2,191 个 2026 年后再无数据的代码**（已摘牌）。
@@ -414,6 +437,40 @@ def _extract_zip(zp, dest):
     return n
 
 
+def _check_scale(old_db, new_db):
+    """口径护栏：两边重叠的最近一段，`turnover` 中位数的比值。
+
+    🔴 缩表护栏只看行数，而这个坑是**值**变了（volume 的单位变了 ->
+      turnover 从百分数变小数，全程 100 倍），行数一行不少。
+    返回 (比值, 说明) 或 None（比不了）。
+    """
+    try:
+        import duckdb
+    except ImportError:
+        return None
+    con = duckdb.connect(':memory:')
+    try:
+        con.execute("ATTACH '%s' AS o (READ_ONLY)" % old_db)
+        con.execute("ATTACH '%s' AS n (READ_ONLY)" % new_db)
+        r = con.execute("""
+            SELECT count(*), median(a.turnover), median(b.turnover)
+            FROM o.raw_basic_daily a JOIN n.raw_basic_daily b
+              USING (symbol, date)
+            WHERE a.date >= (SELECT max(date) FROM n.raw_basic_daily)
+                              - INTERVAL 250 DAY
+              AND a.turnover > 0 AND b.turnover > 0
+              AND substr(a.symbol, 3, 2) IN ('60', '00', '30', '68')
+        """).fetchone()
+        if not r or not r[0] or not r[2]:
+            return None
+        return (r[1] / r[2], '最近 250 天 %s 行，turnover 中位 旧 %.6g / 新 %.6g'
+                % (format(r[0], ','), r[1], r[2]))
+    except Exception:                                       # noqa: BLE001
+        return None
+    finally:
+        con.close()
+
+
 def _probe_schema(newbin, have):
     """新二进制认不认 `schema_version = have` 的库？
 
@@ -633,6 +690,22 @@ def bootstrap(allow_shrink=False, keep_zip=False, reuse_vipdoc=False):
                 _say('   %-20s 最早日 %s -> %s  🔴 起点变晚' % (
                     t, b['first'], a['first']))
                 shrink.append((t, '最早日', b['first'], a['first']))
+        # ---- 口径护栏（行数不缩也要查值）----
+        sc = _check_scale(DB, new)
+        if sc:
+            ratio, note = sc
+            _say('\n口径核对：%s' % note)
+            if not 0.2 < ratio < 5:
+                _say('   🔴 turnover 量级变了 **%.0f 倍** —— 通达信改过'
+                     ' .day 里 volume 的单位（实测：老 vipdoc 是'
+                     '"股×100"、现在下的是"股"）。' % ratio)
+                _say('   面板的 turnover 会从百分数变小数（或反过来），'
+                     '换手榜与 sgmspeg 的 turnover_volatility 全都'
+                     '**静默错 100 倍**。')
+                shrink.append(('raw_basic_daily', 'turnover 量级', 1, ratio))
+            else:
+                _say('   ✓ turnover 量级一致（比值 %.3f）' % ratio)
+
         if shrink and not allow_shrink:
             _say('\n🔴 拒绝替换 —— 有 %d 项缩了。' % len(shrink))
             _say('   原因已实测定案（2026-09-03）：`hsjday.zip` **不含已摘牌'
