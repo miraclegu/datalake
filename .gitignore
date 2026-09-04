@@ -36,5 +36,12 @@
 # 5) 最后再排除「虽然是 .py 但不该入库」的 —— 顺序重要，后匹配者胜
 __pycache__/
 *.py[cod]
-raw/hf/_ingest/venv/
+# 🔴 隔离环境按【通用规则】排除，不要逐个目录写死。
+#    原来只写了 raw/hf/_ingest/venv/ —— 于是新加的 raw/amazing/_ingest/venv
+#    里那几万个 site-packages/*.py 又被 `!*.py` 放行了一遍，**而这不报错**，
+#    只是某次 git add -A 会把整个环境提交进去。
+#    （每个 raw/<源>/_ingest 都可能要自己的 venv：hf 是一个、amazing 是
+#      因为 AmazingData 要 numba>=0.65 会顶掉主环境 numpy。）
+**/venv/
+**/.venv/
 .tmp/

@@ -126,25 +126,117 @@ CLAUDE.md 里写着「涨幅是成分**等权平均**…**本地没有板块指�
 
 ---
 
-## 🔴 三个已知的坑（还没踩，先记着）
+## 🔴 macOS 跑不了 —— 已实测定案（2026-09-04，tgw 1.0.9.2 / AmazingData 1.1.9）
+
+`tgw` 装的是**预编译原生库**，按 `<os>_py<ver>_<arch>_package/` 分目录，
+67 MB 的 wheel（76 个二进制）里只有两套：
+
+```
+tgw/linux_py{36,38,39,310,311,312,313,314}_x64_package/libtgw_python*.so
+tgw/win_py{36,38,39,310,311,312,313,314}_x64_package/_tgw.pyd + tgw.dll
+```
+
+**没有任何 `.dylib`，也没有 arm64。** 而取数那一整条链
+（`login` / `download_data` / `query_api` / `subscribe_api`）连同
+`AmazingData/__init__` 本身都引用 tgw —— 所以 macOS 上**一条数据都取不到**。
+不引用 tgw 的那 51 个模块是纯算子（numba 因子分析、Brinson 归因、
+performance_attribution），本项目自己有引擎，用不上。
+
+### 🔴 而它报出来的错不指向真正的原因
+
+`tgw/__init__.py` 判平台用的是子串匹配：
+
+```python
+if 'win' in sys.platform:   os_info = 'win'
+elif 'linux' in sys.platform: os_info = 'linux'
+else: raise Exception('this system is not supported')
+```
+
+而 macOS 的 `sys.platform` 是 **`'darwin'`** —— **dar[win] 里含 `'win'`**。
+于是 macOS 被判成 **Windows**，去加载 `_tgw.pyd`，实际报出来的是：
+
+```
+ModuleNotFoundError: No module named '_tgw'
+```
+
+看到这句人会以为"包不全、重装一下"。那句 `this system is not supported`
+**永远到不了**（`platform.machine()` 返回的 `'arm64'` 也不在它的
+`AMD64/x86_64/i386/x86` 枚举里，静默落默认 64）。
+
+所以 `setup_amazing.py` 的判据是**扫 wheel 里有没有本机这一款原生库**，
+在**装之前**就给出裁决 —— 不让判断落在一句误导性的 import 报错上。
+
+★ 旁证：`.pyc` 里的 `co_filename` 是
+  `download_data\download_info_data.py`（**反斜杠**）——
+  这批字节码在 Windows 上编译的，macOS 从来不在他们的测试矩阵里。
+
+### 出路（按可靠性排）
+
+1. **Linux x64 / Windows x64 机器或云主机跑采集，只把 parquet 同步回来**
+   —— 与下面那个分层落点天然吻合（`raw/amazing/<表名>/` 按年冻结、
+   原样保存、可追溯）。整条装配链已在本机验证跑通（装成功 + 依赖解齐），
+   换到 Linux 只差 `import` 那一步。
+2. Apple Silicon 上跑 `--platform linux/amd64` 容器：要 QEMU 模拟，
+   而 tgw 是长连接 SWIG C++ 网关，模拟层下的稳定性未验证。
+   （本机当前 docker / colima / podman / lima **一个都没装**。）
+3. 向银河确认有没有 macOS 版（手册推荐环境只列 REDHAT 7.x / Windows 10）。
+
+---
+
+## 🔴 装也要装进独立 venv，不许进主环境
+
+`AmazingData` 要 `numba>=0.65.0`，主环境是 numba 0.61.2。实测在 venv 里
+解出来的是：
+
+| | 主环境 | AmazingData 的 venv |
+|---|---|---|
+| numba | 0.61.2 | **0.67.0** |
+| llvmlite | 0.44.0 | **0.49.0** |
+| numpy | 2.2.6 | **2.5.2** |
+| pandas | 3.0.1 | 3.0.5 |
+
+回测链与 datalake 构建链全都吃 numpy —— 为一个只在 Linux 上跑得起来的
+采集包去动它不值得。所以 `--install` **默认装进 `_ingest/venv/`**
+（659 MB），要装主环境得显式 `--system`。
+
+🔴 **venv 落在仓库里，而 datalake 的 `.gitignore` 是白名单式放行 `*.py`**
+—— site-packages 里那几万个 `.py` 会被放行进 git，**而这不报错**，
+只是某次 `git add -A` 会把整个环境提交进去。原来只写了
+`raw/hf/_ingest/venv/` 一条（逐个目录写死），所以每加一个模块就漏一次；
+现在改成通用规则 `**/venv/` + `**/.venv/`，并有正反两向的实测
+（venv 里的 `.py` 必须被忽略、`build/*.py` 必须仍放行）。
+
+---
+
+## AmazingData 按 Python 版本分包，但那不是平台问题
+
+它里面是 **59 个 `.pyc` + 3 个 `.py`（numba 算子），零个二进制** ——
+按 cp38~cp314 分包是因为 `.pyc` 的 magic number 绑 Python 版本
+（发布字节码而不公开源码），不是因为有 `.so`。本机实测：
+
+```
+py3-none-any      ✓ 可装（tgw 是这个）
+cp313-none-any    ✓ 可装（本机 Python 3.13）
+cp312-none-any    ✗ 本机不接受 —— 3.13 只认 cp313
+```
+
+★ `cpXX-none-any` 这个组合本身可疑：`cpXX` 声明 CPython ABI，而 `none-any`
+  声明"无 ABI 要求、平台无关"。**AmazingData 兑现了**（真没有二进制），
+  **tgw 没兑现**（67 MB 全是 `.so`/`.dll`，也标 `py3-none-any`）。
+  所以体检永远分两步：① pip 装得上 ② `import` 真的成功。
+
+---
+
+## 其余两个坑
 
 1. **`pip install AmazingData` 装的是另一个项目。** PyPI 上那个是
    `0.0.3`（gitee.com/zhanggao2013，13 KB，作者邮箱还是模板占位
    `your_email@example.com`），与银河的 `1.0.24` 无关；`tgw` 在 PyPI 上
-   根本不存在。—— 与 `tdx2db` 那次**同一个坑**：装上去"看着成功"，
-   然后 API 全对不上。只能用网盘下载的 wheel 离线装。
-2. **macOS 能不能用是开放问题。** 手册推荐环境是 REDHAT 7.x / Windows 10，
-   **没列 macOS**。wheel tag 是 `cpXX-none-any` —— `cpXX` 声明 CPython ABI、
-   `none-any` 声明"无 ABI 要求、平台无关"，两者同时出现说明手工指定了 tag。
-   **如果包里有为 Linux/Windows 编的 .so，`any` 就是谎的：装得上、import 才炸。**
-   所以 `setup_amazing.py` 的体检分两步（pip 装得上 / `import` 真的成功），
-   并且会扫 wheel 里有没有 `.so/.pyd/.dylib`。
-   本机实测：`py3-none-any` ✓ 可装、`cp313-none-any` ✓、**`cp312-none-any` ✗**
-   （Python 3.13 只认 cp313）—— 下载时要挑对版本。
-3. **要券商权限**：账号/密码/ip/端口「需联系您的开户营业部申请开通」
+   根本不存在（`pip index versions tgw` → No matching distribution）。
+   —— 与 `tdx2db` 那次**同一个坑**：装上去"看着成功"，然后 API 全对不上。
+   只能用网盘下载的 wheel 离线装。
+2. **要券商权限**：账号/密码/ip/端口「需联系您的开户营业部申请开通」
    （手册 §3.5.1.1）。费用手册里没写。
-
----
 
 ## 接进来之前必须对的三样数
 
