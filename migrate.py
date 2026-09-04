@@ -28,7 +28,7 @@ r"""把整个工作区迁到另一台机器。
 
 | 排除 | 大小 | 为什么 |
 |---|---|---|
-| `datalake/.tmp/` | 6.1 G | DuckDB 溢写临时文件。正常退出会自删，残留说明当时进程被 kill。下次构建自己会建 |
+| `datalake/.tmp/` | 峰值 6.1 G | DuckDB 溢写临时文件。**正常退出会自删**，残留说明当时进程被 kill（本机那 11 个是 2026-08-26 全量重建留下的，2026-09-04 清掉，释放 6.1 G）。删了不影响：清完重跑 panel 全量聚合（1,625 万行），数值指纹逐位一致、`--verify` 全绿，而且 `.tmp/` 仍是 0 个文件 —— 那一档内存就够，不需要溢写 |
 | `datalake/raw/hf/` | 1.5 G | 同花顺概念，**零引用**：`last_fetched` 停在 2026-04-28、没接进 `sync_daily.sh`，selftest 里有断言钉住"代码里没引用它" |
 | `.git/`（两个仓库） | 1.8 G + 18 M | 用 `git clone` 拿代码，不要拷 `.git` 目录。datalake 的 `.git` 里有 7,376 个松散对象、**其中最大两个 blob（558M/524M）不在任何提交里**（曾 `git add` 过大文件没提交）—— `clone` 不会传它们 |
 
@@ -80,7 +80,8 @@ PARTS = [
      '盘中 1 分钟线。★ 漏了不要紧 —— trends2 每次给全天，快照下一分钟就补上'),
     ('datalake/raw/amazing', 'derived',
      'AmazingData 的 wheel 与手册。要用再从网盘下（macOS 跑不了，见 README）'),
-    ('datalake/.tmp', 'skip', 'DuckDB 溢写临时文件，下次构建自己会建'),
+    ('datalake/.tmp', 'skip',
+     'DuckDB 溢写临时文件。正常退出自删，残留=当时进程被 kill。删了不影响'),
     ('datalake/raw/hf', 'skip', '同花顺概念，零引用（selftest 有断言钉住）'),
     ('datalake/.git', 'skip', '用 git clone 拿代码；里面还有 1 G 悬空对象'),
     ('assay/.git', 'skip', '同上'),
