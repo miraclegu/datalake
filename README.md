@@ -444,6 +444,27 @@ WHERE m.class = 'stock'          -- ← 少了这行就错
 
 ## 存储账目：数据存了几遍 / 换台机器要带什么
 
+> **要真的迁一台机器：`python3 datalake/migrate.py`**（清单 / 指纹 / 验证）。
+> 下面这张表回答的是**另一个**问题 —— "同一份事实存了几遍"。
+> 两个口径不要混：
+> · 表里的「净数据 1.14 GB」= **去重后的事实量**（不含 tdx.db 与 downloads/，
+>   因为它们与 parquet 同源）
+> · `migrate.py` 的「必须拷 2.6 GB」= **迁移时不得不带的**（tdx.db 与
+>   downloads/ 恰恰在里面 —— 它们是**不可重建的原始凭据**，不是冗余）
+
+🔴 **而且"能重建"不等于"该重建"。** 表里 `std/` `mart/` 标"重算"是对的
+（脚本能生成），但**迁移的主方案是连它们一起拷**：
+
+- 排除三类不该带的（`.tmp/` 6.1 G、`raw/hf/` 1.5 G、`.git/` 1.8 G）之后
+  全量只有 **约 6 GB**，一次 rsync 的事
+- 重建要按 loader 的**依赖顺序**跑一串脚本，而顺序错了的表现是
+  **数据不等价且不报错** —— 用这个风险去省 3 GB 不值
+- 拷贝是逐字节的，可以用文件 md5 验；重建出来的 parquet **字节必然不同**
+  （压缩参数与元数据），只能用数值指纹验（`migrate.py` 两层都给）
+
+★ 只在带宽/介质受限时才走"最小拷 + 重建"，而且必须跑完
+  `migrate.py --verify` + `build_panel_daily.py --verify` + `selftest.py --all`。
+
 **lake.db 零复制，raw→std 基本零复制，真正的重复在 ingest→raw。**
 （体积为 2026-09-03 实测）
 
@@ -464,6 +485,22 @@ WHERE m.class = 'stock'          -- ← 少了这行就错
 
 **净数据约 1.14 GB**（kline + basic + factor + snapshots + financials）——
 其余都是"可重建"或"同源的另一种格式"。
+
+### 迁移时容易漏的三件（都在 `migrate.py` 的步骤里）
+
+1. **依赖只有两个**：`pip install duckdb pandas pyarrow`
+   （`playwright` 仅 `selftest` 的 web 用例要，另需 `playwright install chromium`）。
+   本仓库刻意不引别的 —— 看板是 stdlib-only 的 `ThreadingHTTPServer`。
+2. **`finacial/CLAUDE.md` 是指向 `assay/CLAUDE.md` 的符号链接，而它本身
+   不在任何仓库里** —— clone 完要手动建：`ln -sf assay/CLAUDE.md CLAUDE.md`
+3. 🔴 **`tdx2db` 二进制不要拷**（平台相关，60 MB 的 Go 产物）——
+   `setup_tdx.py --install` 按本机 OS 装。★ 装的必须还是 **v2026.5**：
+   新版要 schema v6 而库是 v5，护栏会拦，别加 `--force`。
+   同理 `--install-timer` 要在新机器上重新生成（plist 里是绝对路径）。
+
+★ 验完数据还要**两种模式各起一次** `serve.py`：不带参数（全功能）与
+  `--readonly`。前者才会走起实盘/行情线程那段 —— 只验 `--readonly`
+  会漏掉整条路径（拆 server.py 时就这么漏过一次，见 assay/CLAUDE.md）。
 
 ### 一键装配：`setup_tdx.py`
 
