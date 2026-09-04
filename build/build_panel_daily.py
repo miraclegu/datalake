@@ -135,6 +135,7 @@ INDEXES = {'000300.XSHG': 'in_hs300', '000905.XSHG': 'in_zz500',
 #
 #     volume/100 均价在区间内   13,572,591 行 (83.5%)  ✓ volume = 股×100
 #     volume/100 均价【偏低】    2,605,904 行 (16.0%)  🔴 volume = 股×10000
+#     volume/100 均价【偏高】       74,952 行 (0.46%)  🔴 volume = 股（少乘100）
 #
 #   也就是说**早期的 volume 比近期又多乘了 100**。表现是 2005 年中位换手率
 #   94.96%、2008 年 167.11% —— 数字荒谬却**不报错**，而 2011 年后完全正常，
@@ -150,6 +151,43 @@ INDEXES = {'000300.XSHG': 'in_hs300', '000905.XSHG': 'in_zz500',
 #   "用 amount 元对元，绕开单位陷阱"那条）。
 #
 #   turnover 同源（tdx 用同一个 volume 算的），所以**共用同一个 flag**。
+#   ★ 三档的判据只写在 cur 的 `vol_div` 一处，volume_shares 与 turnover
+#     都读它 —— 原来两处各写一遍同一个 CASE，加第三档时就会分叉。
+#   🔴 turnover 主档必须**原样返回**：浮点下 `x*100.0/100.0 != x`，
+#     写成统一公式会让 2025 年 180,145 行的末位悄悄变化（是"除该改的之外
+#     必须逐行不变"那条断言抓到的）。
+#
+# 🔴🔴 第三档「volume 少乘了 100」——【只有 17 天，但每天几乎全市场】
+#   （2026-09-04 定案。判据：把 volume_shares 乘回 100 之后 vwap 必须落进
+#     当日 [low, high] —— 实测 74,952/74,952 = **100.00% 命中**，
+#     修正后 vwap/中价 中位数 1.0003。）
+#
+#     2020-02-27  2020-04-10  2020-04-30  2020-06-11  2020-07-13  2020-07-29
+#     2021-04-02  2021-06-21  2021-12-28  2022-02-08  2022-06-02  2022-07-13
+#     2022-09-29  2023-02-28  2023-03-02  2024-11-19  2025-03-03
+#
+#   这 17 天的 volume 是**真实股数**口径（不是股数×100），turnover 同步错：
+#   那几天中位 turnover 0.012~0.035，而正常日是 **1.6793** —— 差 100 倍，
+#   换手榜与 sgmspeg 的 turnover_volatility 在那 17 天全是错的，**而它不报错**。
+#   成因：tdx2db 的 md1 增量合并路径写 .day 时 volume 没换算成"股×100"
+#   （`makeDayRecord` 里 `PutUint32(buf[24:28], rec.Volume)` 直接写股数）。
+#   🔴 升级 tdx2db **修不了它**：PR #118/#124 都没动那一行（见 setup_tdx.py）。
+#
+# 🔴 上一轮把这批诊断成「amount 偏大、volume 是对的」是**错的**，
+#   因为当时的"第三方判据"是 `turnover × 流通股数`，而 turnover 本身就是
+#   tdx2db 用 volume 算出来的 —— **判据循环，必然自我印证**。
+#   （同数据字典索引 4 G 节「用有噪声的重建做单变量隔离」那条：
+#     统计吻合 ≠ 验对了东西。真正的第三方判据是 amount 与 [low, high]，
+#     元对元，与 volume 的单位无关。）
+#
+# 🔴 剩下 13 行 vwap 仍偏高的是**另一回事**：`.day` 的 volume 字段是
+#   **uint32**（上限 42.9 亿股），京东方 A 单日成交 51.9 亿股直接溢出。
+#   拿新浪真值对过，精确到个位：
+#       2026-06-30 真 5,187,899,669 股 − 2^32 = 892,932,373 = 库里 volume/100
+#   这是通达信 .day 的**格式物理上限**，换 tdx2db 版本也修不了。
+#   所以第三档必须带"乘回 100 之后 vwap 落进区间"这个保护条件 ——
+#   只看"vwap 偏高"会把这 9 行一起改错（变异测试：删掉该条件后
+#   verify 立刻抓到 8 行，vwap 变成 0.50 而 low=8.11）。
 #
 # 成交量单位陷阱（近期那一段）：tdx 原始 volume 字段的值是【股数 × 100】。
 #   交叉验证：volume/100 算换手率得 0.4731，面板 turnover 列 0.473107，精确吻合；
@@ -474,28 +512,47 @@ def build_year(con, y):
         SELECT *, lag(close_hfq) OVER (PARTITION BY jq_code ORDER BY date) AS prev_hfq
         FROM base
     ), cur AS (
-        SELECT * FROM px WHERE date >= DATE '{y}-01-01'
+        -- 🔴 成交量单位的逐行判据【只写这一处】：volume_shares 与 turnover
+        --   都由它驱动。原来两处各写一遍同一个 CASE —— 加第三档时就会分叉，
+        --   而"换手率和成交量对不上"**不报错**。
+        --   三档都是实测定案的（判据与证据见文件头「成交量单位」那一节）：
+        --     10000  早期 volume 又多乘了 100（vwap 低于当日最低价）
+        --        1   那 17 天 volume 是"真实股数"口径、少乘了 100
+        --      100   正常口径（volume = 股数 × 100）
+        --   ★ 第二档必须加"乘回 100 之后 vwap 落进当日区间"这一条 ——
+        --     只看"vwap 高于 high"会把 uint32 溢出那类（京东方 9 行）
+        --     一起改错，而它们乘 100 之后更离谱。
+        SELECT *,
+            CASE
+              WHEN low > 0 AND volume > 0 AND amount > 0
+                   AND amount / (volume / 100.0) < low * 0.99
+                THEN 10000.0
+              WHEN low > 0 AND high > 0 AND volume > 0 AND amount > 0
+                   AND amount / (volume / 100.0) > high * 1.01
+                   AND amount / volume BETWEEN low * 0.99 AND high * 1.01
+                THEN 1.0
+              ELSE 100.0
+            END AS vol_div
+        FROM px WHERE date >= DATE '{y}-01-01'
     )
     SELECT
         c.date, c.jq_code, c.symbol,
         c.close_bfq, c.open, c.high, c.low,
-        -- 🔴 逐行判据（见文件头）：均价 = amount/(volume/100) 若【低于当日最低价】，
-        --   说明这一行的 volume 又多乘了 100（早期数据），再除 100。
-        --   用 0.99 留一点容差；实测双峰之间只有 5 行，边界不模糊。
-        CASE WHEN c.low > 0 AND c.volume > 0 AND c.amount > 0
-              AND c.amount / (c.volume / 100.0) < c.low * 0.99
-             THEN c.volume / 10000.0 ELSE c.volume / 100.0
-        END AS volume_shares,
+        -- 判据在 cur 的 vol_div 里（只写一处）
+        c.volume / c.vol_div AS volume_shares,
         c.amount,
         c.close_hfq, c.hfq_factor,
         CASE WHEN c.prev_hfq > 0 THEN c.close_hfq / c.prev_hfq - 1 END AS ret_1d,
         b.preclose, b.change_pct, b.amplitude,
-        -- turnover 与 volume 同源（tdx 用同一个 volume 算的）——【同一个 flag】。
-        -- 不给它单独判据：两处判据迟早分叉，而"换手率和成交量对不上"不报错。
-        CASE WHEN c.low > 0 AND c.volume > 0 AND c.amount > 0
-              AND c.amount / (c.volume / 100.0) < c.low * 0.99
-             THEN b.turnover / 100.0 ELSE b.turnover
-        END AS turnover,
+        -- turnover 与 volume 同源（tdx 用同一个 volume 算的）——【同一个 vol_div】，
+        -- 这里只按档分派、不重复判据。
+        -- 🔴 主档必须**原样返回**，不能写成 `turnover*100/vol_div`：
+        --   浮点下 `x*100.0/100.0 != x`，实测那样写会让 2025 年 180,145 行的
+        --   turnover 发生末位变化 —— 一行都不该变的地方变了 18 万行，
+        --   **而它不报错**（是"逐行比对除该改的之外必须不变"那条断言抓到的）。
+        CASE c.vol_div WHEN 10000.0 THEN b.turnover / 100.0
+                       WHEN 1.0     THEN b.turnover * 100.0
+                       ELSE b.turnover END AS turnover,
         -- ★ 市值为 0 是【缺失值伪装成极值】，不是真值：300114.XSHE 有真实价格
         --   与成交量却 floatmv=totalmv=0（tdx 股本数据缺失）。按市值【升序】选股时
         --   0 永远排第一 —— 实测它从 2016 年起 2056 个交易日一直霸占 v0b 候选池首位，
@@ -799,11 +856,16 @@ def verify(con):
           '（%d 行在白名单，%d 行是新的）'
           % (format(r[1], ','), len(bad) + len(KNOWN_VWAP_BELOW_LOW),
              len(KNOWN_VWAP_BELOW_LOW), len(bad)))
-    # ⚠️ 偏高的那一批是【另一个问题】：amount 偏大（实测 74,963 行，0.46%，
-    #   集中在 2020~2026）。用第三方判据 turnover 反算股数验证过：
-    #   volume_shares 是对的、amount 不对。**没修**，先看住不让它扩大。
-    check(r[2] <= max(90000, r[0] * 0.006),
-          '均价 <= 当日最高价 —— 偏高 %s 行 (%.4f%%)，已知 amount 偏大那批'
+    # ⚠️ 偏高的那一批原来有 74,963 行（0.46%），已在 2026-09-04 定案并修掉
+    #   74,952 行（第三档「volume 少乘 100」，见文件头）。**剩下的是**
+    #   `.day` volume 字段 uint32 溢出（京东方 A 单日 51.9 亿股 > 42.9 亿）
+    #   + 几行小额成交的舍入噪声 —— 那是源文件的格式物理上限，修不了。
+    #   🔴 阈值从 90,000 收到 **500**：坑修掉之后还留着旧阈值，等于这条断言
+    #     再也拦不住任何回归（74,952 行重新出现都在 90,000 以内）。
+    #     溢出行会随超大流通盘的成交慢慢增加，所以留绝对余量而不是比例。
+    check(r[2] <= 500,
+          '均价 <= 当日最高价 —— 偏高 %s 行 (%.4f%%)，'
+          '预期只剩 uint32 溢出那类（阈值 500）'
           % (format(r[2], ','), 100.0 * r[2] / max(r[0], 1)))
 
     # 5a2) 换手率的量级：中位数必须像换手率
@@ -816,6 +878,21 @@ def verify(con):
         GROUP BY 1 HAVING median(turnover) > 20 ORDER BY 1""" % P).fetchall()
     check(not bad, '各年 turnover 中位 <= 20%%（换手率量级）—— 异常年份: %s'
           % (', '.join('%s=%.1f' % (a, b) for a, b in bad) or '无'))
+
+    # 5a3) 🔴 还要按【日】查下限 —— 上面按年查的那条**抓不到"少乘 100"那类**：
+    #   那 17 天散落在 6 年里、每年只 1~6 天，年中位被 1300 万行正常数据淹掉
+    #   （实测：修之前 17 天全在库里，"各年 turnover 中位 <= 20%" 照样全绿）。
+    #   ★ 这是一道【独立】判据：vwap 那条只看 volume，万一将来 volume 修对了
+    #     而 turnover 没跟上（两处分叉），只有这条能抓到。
+    #   阈值 0.2：正常日中位 1.68，坏的那 17 天是 0.012~0.035 —— 留 6 倍余量。
+    #   只查 2005 年后（更早年份股票少、停牌多，中位不稳）。
+    bad = con.execute("""SELECT CAST(date AS VARCHAR) AS d, median(turnover) AS m
+        FROM %s WHERE turnover IS NOT NULL AND turnover > 0
+          AND public_status IN ('正常上市','ST','*ST') AND date >= DATE '2005-01-01'
+        GROUP BY 1 HAVING median(turnover) < 0.2 AND count(*) > 500
+        ORDER BY 1""" % P).fetchall()
+    check(not bad, '每日 turnover 中位 >= 0.2%%（"volume 少乘 100"那类）—— 异常日: %s'
+          % ([('%s=%.4f' % (d, m)) for d, m in bad[:6]] if bad else '无'))
 
     # 5b) 🔴 PIT: 不应有上市日之前的行情（已知代码复用案例走白名单）
     rows = con.execute('''SELECT jq_code, count(*) FROM %s WHERE listed_days < 0
@@ -908,8 +985,13 @@ def main():
         print('  合计 %s 行' % format(tot, ','))
         if not a.year:
             build_paused(con)
-    if a.verify or not a.year:
-        verify(con)
+    # 🔴 **总是**校验。原来是 `if a.verify or not a.year`，于是 `--year`
+    #   一项都不验、却照样打印「✅ 全部通过」—— 看着像验过了。
+    #   实测踩到：单年重建把京东方 9 行改错成 vwap=0.50（low=8.11），
+    #   仍然「全部通过」。verify 读的是磁盘上**全部**分区（P 是 glob），
+    #   单年重建后跑它同样有效，而且顺带能发现"只重建了一年、别的年份还是
+    #   旧口径"这种跨年不一致。
+    verify(con)
     con.close()
     if FAILURES:
         print('\n❌ %d 项未通过:' % len(FAILURES))
