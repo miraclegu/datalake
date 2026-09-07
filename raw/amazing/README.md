@@ -176,6 +176,12 @@ ModuleNotFoundError: No module named '_tgw'
    —— 与下面那个分层落点天然吻合（`raw/amazing/<表名>/` 按年冻结、
    原样保存、可追溯）。整条装配链已在本机验证跑通（装成功 + 依赖解齐），
    换到 Linux 只差 `import` 那一步。
+   ✅ **采集端已经写好了：`_ingest/`**（九个脚本 + 一个总调度，34 张表，
+   783 个字段的说明）。怎么在 Windows 上跑、有哪些坑，见
+   **[`_ingest/README.md`](_ingest/README.md)**。
+   ★ 取数逻辑（分片 / 断点续跑 / 重试 / schema 统一 / 字段说明）已经在
+   **macOS 上用假 SDK 验过 157 条断言**（`_ingest/selftest.py`）——
+   不用等到上机才第一次执行到那些代码路径。
 2. Apple Silicon 上跑 `--platform linux/amd64` 容器：要 QEMU 模拟，
    而 tgw 是长连接 SWIG C++ 网关，模拟层下的稳定性未验证。
    （本机当前 docker / colima / podman / lima **一个都没装**。）
@@ -253,11 +259,17 @@ cp312-none-any    ✗ 本机不接受 —— 3.13 只认 cp313
 ## 分层落点（照 datalake 的三层判据）
 
 ```
-raw/amazing/_ingest/     SDK 缓存、账号（account.json 不入 git）、采集脚本
-raw/amazing/<表名>/      按年冻结的 parquet（原样保存，可追溯）
-std/                     跨源决策后的标准层
-mart/                    面板
+raw/amazing/_ingest/           采集脚本 + SDK 缓存 + 账号（account.json 不入 git）
+raw/amazing/字段说明总览.md     34 张表的索引（pull_all.py 生成）
+raw/amazing/<表名>/            parquet，一个分片一个 part（原样保存，可追溯）
+raw/amazing/<表名>/_字段说明.md 逐字段的类型 + 中文说明 + 这张表的坑
+std/                           跨源决策后的标准层
+mart/                          面板
 ```
+
+🔴 **`_字段说明.md` 的下划线是必须的**：数据目录里混一个非 parquet 文件时
+`pd.read_parquet('<表名>/')` 会直接炸（pyarrow 只跳过 `_`/`.` 开头的文件）。
+这条是自证抓出来的 —— 写的时候不报错，只在**别人读整张表**时才炸。
 
 ★ `_ingest/account.json` **不会**被提交 —— datalake 的 `.gitignore` 是
 白名单式（只放行 `*.py`/`*.md`/`*.sh`/`*.sql`），`.json` 天然进不去。

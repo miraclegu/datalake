@@ -795,6 +795,14 @@ LABEL = 'com.miraclegu.finacial.sync'
 TICK_LABEL = 'com.miraclegu.finacial.tick'
 TICK_PY = os.path.join(os.path.dirname(ROOT), 'assay', 'tick_daily.py')
 TICK_AT = '07:00,08:00,09:00'
+# 数据同步改成**轮询**：16:00 起每 10 分钟问一次「齐没齐」，齐了就早退。
+#   判据在 build/is_stale.py（那里写了为什么不写死时间）。
+# ★ 这个序列恰好**包含 18:10**（16:00 + 10×13），所以原来那个独立的
+#   18:10 timer 是冗余的 —— 删掉它，少一处要对齐的时间常量。
+# 🔴 而且第一个点位（16:00）必然判成"该跑"（那时今天的 PIT 快照与行情都
+#   还没抓），所以**完整链每个交易日至少跑一次** —— `daily_snapshot.py`
+#   漏一天永久丢失，这条保证不能靠"数据恰好齐了"。
+POLL_FROM, POLL_TO, POLL_EVERY = '16:00', '20:00', 10
 SH = os.path.join(ROOT, 'sync_daily.sh')
 
 
@@ -889,8 +897,11 @@ def _plist(label, args, times, tag):
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<!-- 由 datalake/setup_tdx.py --install-timer 生成（路径取自当前仓库）。
-     手改这个文件的话，下次 --install-timer 会覆盖它。 -->
+<!-- 由 datalake/setup_tdx.py 的 install-timer 生成（路径取自当前仓库）。
+     手改这个文件的话，下次 install-timer 会覆盖它。
+     🔴 注释里不能出现两个连字符 —— XML 规范禁止，而 plutil -lint 会说 OK
+     （Apple 的解析器宽容、launchd 也照跑），Python 的 expat 却直接拒绝。
+     原来这里写的是带前缀的参数名，于是 plist 一直是非法 XML 而没人发现。 -->
 <dict>
   <key>Label</key><string>%s</string>
   <key>ProgramArguments</key>
@@ -932,6 +943,22 @@ def _verify_sched_env():
     return True
 
 
+def _range_times(start, end, step_min):
+    """'16:00'~'20:00' 每 10 分钟 -> 25 个点位。
+
+    ★ 用 StartCalendarInterval 的**数组**而不是 StartInterval（每 N 秒）：
+      后者全天每 10 分钟唤醒一次（144 次），日志里全是"不在窗口内"。
+    """
+    sh, sm = (int(x) for x in start.split(':'))
+    eh, em = (int(x) for x in end.split(':'))
+    t, last = sh * 60 + sm, eh * 60 + em
+    out = []
+    while t <= last:
+        out.append((t // 60, t % 60))
+        t += step_min
+    return out
+
+
 def _times(spec):
     """'07:00,08:00' -> [(7,0),(8,0)]。"""
     out = []
@@ -959,7 +986,12 @@ def install_timer(at='18:10', tick_at=TICK_AT):
         raise SystemExit('🔴 找不到 %s' % TICK_PY)
     ok = _verify_sched_env()
     JOBS = [
-        (LABEL, ['/bin/bash', SH], _times(at), 'sync', '数据同步'),
+        # 🔴 带 --if-stale：判据是"数据齐没齐"，不是"到点没到点"。
+        #   齐了就秒退（连日志文件都不建），所以密集轮询的成本很低。
+        (LABEL, ['/bin/bash', SH, '--if-stale'],
+         _range_times(POLL_FROM, POLL_TO, POLL_EVERY), 'sync',
+         '数据同步（%s~%s 每 %d 分钟轮询）'
+         % (POLL_FROM, POLL_TO, POLL_EVERY)),
         (TICK_LABEL, [sys.executable, TICK_PY], _times(tick_at), 'tick',
          '信号重算'),
     ]
@@ -976,8 +1008,12 @@ def install_timer(at='18:10', tick_at=TICK_AT):
             _run(['launchctl', 'load', '-w', p], check=False)
             shutil.copyfile(p, os.path.join(ROOT, '_manifest',
                                             label + '.plist'))
-            _say('✅ %s：每日 %s' % (what, ' / '.join(
-                '%02d:%02d' % t for t in times)))
+            shown = (' / '.join('%02d:%02d' % t for t in times)
+                     if len(times) <= 6 else
+                     '%02d:%02d ~ %02d:%02d 共 %d 个点位'
+                     % (times[0][0], times[0][1], times[-1][0],
+                        times[-1][1], len(times)))
+            _say('✅ %s：每日 %s' % (what, shown))
         # 🔴 判据是 launchctl 里到底有没有，不是上面几条命令的返回码
         out = subprocess.run(['launchctl', 'list'], capture_output=True,
                              text=True).stdout

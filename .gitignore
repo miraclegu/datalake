@@ -23,6 +23,10 @@
 # 4) 放行少量小型元数据（77 张 JQ 表的清单，抽取脚本的产出）
 !raw/jq/_ingest/jq_tables.csv
 
+# 4a) 依赖清单 = 代码。没有它，换一台机器装出来的环境不一样，
+#     而"不一样"的表现不是报错，是某个接口静默少写一列（见那个 tables 包）。
+!raw/amazing/_ingest/requirements.txt
+
 # 4b) 调度配置 = 代码。launchd 的 plist 决定每日同步几点跑，
 #     丢了就等于同步默默停了（而"停了"这件事本身不报错）。
 !_manifest/*.plist

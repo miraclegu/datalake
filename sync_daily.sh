@@ -5,6 +5,15 @@
 #   bash datalake/sync_daily.sh            # 正常跑
 #   bash datalake/sync_daily.sh --no-live  # 只同步数据，不触发信号
 #   bash datalake/sync_daily.sh --dry      # 只打印会做什么
+#   bash datalake/sync_daily.sh --if-stale # 数据已齐就直接退出（给轮询用）
+#
+# ## 为什么有 --if-stale：把「几点跑」换成「齐没齐」
+#
+# 通达信什么时候放出当天数据是**它说了算**的，写死 18:10 有两种坏法：
+# 定早了抓不到（而 tdx2db cron 不会因此报错，只是库里没有当天的行）、
+# 定晚了白等两小时。所以 16:00 起每 10 分钟问一次，不齐就试着抓 ——
+# 判据落在"数据现在是什么状态"上，而不是"到点没到点"。
+# 判据本身在 build/is_stale.py（可单独跑、可单独测）。
 #
 # ## 为什么定时不放 serve.py 里
 #
@@ -42,11 +51,28 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 LOG="$LOGDIR/$STAMP.log"
 mkdir -p "$LOGDIR"
 
-NO_LIVE=0; DRY=0
+NO_LIVE=0; DRY=0; IF_STALE=0
 for a in "$@"; do
   [ "$a" = "--no-live" ] && NO_LIVE=1
   [ "$a" = "--dry" ] && DRY=1
+  [ "$a" = "--if-stale" ] && IF_STALE=1
 done
+
+# ---- --if-stale：先问"齐没齐"，齐了就直接退出 ----
+# 判据全在 build/is_stale.py（那里写了为什么），这里只按退出码分流：
+#   0 已齐 / 2 现在不该跑（非交易日、未收盘、上一轮正在抓）-> 都是什么都不做
+#   1 该跑 -> 往下走
+# ★ 这两种情况**不建日志文件**：轮询每 10 分钟一次，大部分时候"不用跑"，
+#   每次都建一个日志会把真正有内容的那些冲掉（只保留最近 60 个）。
+#   launchd 的 StandardOutPath 里仍有一行记录，够追溯。
+if [ "$IF_STALE" = "1" ]; then
+  OUT=$(python3 "$DL/build/is_stale.py" 2>&1); RC=$?
+  if [ "$RC" = "0" ] || [ "$RC" = "2" ]; then
+    echo "[$(date '+%m-%d %H:%M')] $OUT"
+    exit 0
+  fi
+  echo "[$(date '+%m-%d %H:%M')] $OUT"
+fi
 
 STEPS_OK=(); STEPS_BAD=(); T0=$(date +%s)
 

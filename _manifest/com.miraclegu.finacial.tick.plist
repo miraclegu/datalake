@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- 由 datalake/setup_tdx.py 的 install-timer 生成（路径取自当前仓库）。
+     手改这个文件的话，下次 install-timer 会覆盖它。
+     🔴 注释里不能出现两个连字符 —— XML 规范禁止，而 plutil -lint 会说 OK
+     （Apple 的解析器宽容、launchd 也照跑），Python 的 expat 却直接拒绝。
+     原来这里写的是带前缀的参数名，于是 plist 一直是非法 XML 而没人发现。 -->
+<dict>
+  <key>Label</key><string>com.miraclegu.finacial.tick</string>
+  <key>ProgramArguments</key>
+  <array><string>/opt/homebrew/opt/python@3.13/bin/python3.13</string><string>/Users/guhao/finacial/assay/tick_daily.py</string></array>
+  <key>WorkingDirectory</key><string>/Users/guhao/finacial/datalake</string>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>/Users/guhao/finacial/datalake/_manifest/launchd-tick.out</string>
+  <key>StandardErrorPath</key><string>/Users/guhao/finacial/datalake/_manifest/launchd-tick.err</string>
+  <!-- 机器睡过了预定时刻，醒来补跑一次 —— 这正是不用 cron 的理由 -->
+  <key>RunAtLoad</key><false/>
+  <!-- 🔴 PATH 里必须有装了 duckdb 的那个 python3；launchd 默认环境很窄，
+       缺了它 2/6 PIT 快照会 ModuleNotFoundError，而那一步漏一天不可逆 -->
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/opt/python@3.13/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+</dict>
+</plist>
