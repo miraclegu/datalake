@@ -798,7 +798,11 @@ TICK_PY = os.path.join(os.path.dirname(ROOT), 'assay', 'tick_daily.py')
 # 见 load_schedule()。默认值只在配置文件不存在/读不了时用。
 DEFAULT_SCHED = {
     'sync': {'from': '16:00', 'to': '20:00', 'every': 10},
-    'tick': {'from': '07:00', 'to': '09:20', 'every': 60},
+    #   ★ 信号重算的窗口从 16:00 一直开到**次日** 09:20（跨午夜）：
+    #     公告集中在 16:00~22:00，而人常在晚上手动导聚宽增量 ——
+    #     窗口只开早上的话，晚上导完要等到 07:00 才会被算进去。
+    #     判据 ③（数据指纹没变就跳过）保证多出来的点位不产生噪声。
+    'tick': {'from': '16:00', 'to': '09:20', 'every': 60},
 }
 SCHED_FILE = os.path.join(ROOT, '_manifest', 'schedule.json')
 # 合法区间。🔴 `every` 有下限是因为每个点位都是一次 launchd 唤醒 + 一次
@@ -987,9 +991,10 @@ def check_schedule(sc):
         lo, hi = SCHED_LIMITS['every_min'], SCHED_LIMITS['every_max']
         if not (lo <= ev <= hi):
             return False, '%s.every 要在 %d~%d 分钟之间，实得 %d' % (k, lo, hi, ev)
-        if a > b:
-            return False, '%s 的起点 %s 晚于终点 %s' % (k, d['from'], d['to'])
-        n = (b - a) // ev + 1
+        #   ★ `a > b` **不再是错误**：那是跨午夜（16:00 ~ 次日 09:20）。
+        #     分不出"跨午夜"与"填反了"，所以不猜 —— 页面上标「次日」+
+        #     点位数，让人自己看出来（见 _span 的 docstring）。
+        n = _span(d['from'], d['to']) // ev + 1
         if n > SCHED_LIMITS['max_slots']:
             return False, ('%s 会生成 %d 个点位，超过上限 %d —— '
                            '把间隔调大或窗口缩短'
@@ -1060,16 +1065,35 @@ def _range_times(start, end, step_min):
       后者全天每 10 分钟唤醒一次（144 次），日志里全是"不在窗口内"。
     """
     t, last = _hhmm(start), _hhmm(end)
-    out = []
-    while t <= last:
-        out.append((t // 60, t % 60))
-        t += step_min
+    span = _span(start, end)
+    out, k = [], 0
+    while k <= span:
+        m = (t + k) % (24 * 60)
+        out.append((m // 60, m % 60))
+        k += step_min
     # ★ 间隔除不尽时**补上终点**：07:00~09:20 每 60 分钟本来只到 09:00，
     #   那 09:00~09:20 之间导入的数据要等到明天才会被算进去 ——
     #   而"窗口写到 09:20"的意思就是"管到 09:20"。
     if out and out[-1] != (last // 60, last % 60):
         out.append((last // 60, last % 60))
     return out
+
+
+def _span(start, end):
+    """窗口跨多少分钟。`起点 > 终点` 视为**跨午夜**（16:00 ~ 次日 09:20）。
+
+    🔴 launchd 的 StartCalendarInterval 只是一组 (Hour, Minute)、每天都触发，
+      所以"跨午夜"对它不是特例 —— 点位集合就是
+      {16:00…23:00} ∪ {00:00…09:00} ∪ {09:20}。
+
+    🔴 但**分不出"跨午夜"和"填反了"** —— `09:20~07:00` 两种读法都讲得通。
+      所以不在这里猜：算成跨午夜，然后让 `show_schedule` 回一个 `wrap` 标记，
+      页面上写成「16:00 ~ **次日** 09:20 · 19 个点位」。
+      填反了的话那个"次日"和点位数会当场看出来 ——
+      静默拒掉或静默按跨午夜处理都比它糟。
+    """
+    a, b = _hhmm(start), _hhmm(end)
+    return (b - a) if b >= a else (24 * 60 - a) + b
 
 
 def _times(spec):
@@ -1126,6 +1150,8 @@ def show_schedule():
             'match': (got == want) if got is not None else None,
             'first': ('%02d:%02d' % want[0]) if want else None,
             'last': ('%02d:%02d' % want[-1]) if want else None,
+            #   ★ 跨午夜要让页面说出来（「16:00 ~ 次日 09:20」）
+            'wrap': _hhmm(d['from']) > _hhmm(d['to']),
         }
     return out
 
@@ -1184,11 +1210,13 @@ def install_timer(at=None, tick_at=None):
             _run(['launchctl', 'load', '-w', p], check=False)
             shutil.copyfile(p, os.path.join(ROOT, '_manifest',
                                             label + '.plist'))
+            #   ★ 跨午夜要写出「次日」—— "16:00 ~ 09:20" 看着像填反了。
+            _wrap = times[-1] < times[0]
             shown = (' / '.join('%02d:%02d' % t for t in times)
                      if len(times) <= 6 else
-                     '%02d:%02d ~ %02d:%02d 共 %d 个点位'
-                     % (times[0][0], times[0][1], times[-1][0],
-                        times[-1][1], len(times)))
+                     '%02d:%02d ~ %s%02d:%02d 共 %d 个点位'
+                     % (times[0][0], times[0][1], '次日 ' if _wrap else '',
+                        times[-1][0], times[-1][1], len(times)))
             _say('✅ %s：每日 %s' % (what, shown))
         # 🔴 判据是 launchctl 里到底有没有，不是上面几条命令的返回码
         out = subprocess.run(['launchctl', 'list'], capture_output=True,
