@@ -787,11 +787,19 @@ def sync(minute=False):
 
 # ------------------------------------------------------------ 每日定时任务
 LABEL = 'com.miraclegu.finacial.sync'
+# 早上重算调仓信号的那个 timer。★ 与 sync 分开是因为它们回答不同的问题：
+#   sync   18:10  把当天的行情/复权抓全（数据）
+#   tick   次日 07:00/08:00/09:00  出当天的调仓清单（决策）
+#   —— A 股公告集中在 16:00~22:00，其中 ST/停牌是次日生效的，
+#      18:10 那份算出来的清单可能与早上不一样（见 assay/tick_daily.py）。
+TICK_LABEL = 'com.miraclegu.finacial.tick'
+TICK_PY = os.path.join(os.path.dirname(ROOT), 'assay', 'tick_daily.py')
+TICK_AT = '07:00,08:00,09:00'
 SH = os.path.join(ROOT, 'sync_daily.sh')
 
 
-def _launchd_path():
-    return os.path.expanduser('~/Library/LaunchAgents/%s.plist' % LABEL)
+def _launchd_path(label=LABEL):
+    return os.path.expanduser('~/Library/LaunchAgents/%s.plist' % label)
 
 
 def _timer_status():
@@ -858,11 +866,25 @@ def _sched_path():
     return ':'.join([here] + [x for x in base if x != here])
 
 
-def _plist(hour, minute):
+def _plist(label, args, times, tag):
     """从**当前仓库路径**生成 —— 仓库里那份的绝对路径是我这台机器的，
-    换台机器直接 cp 过去就指错了（而 launchd 不会因此报错，只是不跑）。"""
-    log = os.path.join(ROOT, '_manifest', 'launchd.out')
-    err = os.path.join(ROOT, '_manifest', 'launchd.err')
+    换台机器直接 cp 过去就指错了（而 launchd 不会因此报错，只是不跑）。
+
+    ★ `times` 是 [(时,分), ...]。多个时间点时 StartCalendarInterval 用
+      **数组**（launchd 支持）—— 装三个 plist 会让"改一个点位"变成改三处。
+    """
+    log = os.path.join(ROOT, '_manifest', 'launchd-%s.out' % tag)
+    err = os.path.join(ROOT, '_manifest', 'launchd-%s.err' % tag)
+    if len(times) == 1:
+        sched = ('  <dict><key>Hour</key><integer>%d</integer>\n'
+                 '        <key>Minute</key><integer>%d</integer></dict>'
+                 % times[0])
+    else:
+        sched = '  <array>\n' + '\n'.join(
+            '    <dict><key>Hour</key><integer>%d</integer>'
+            '<key>Minute</key><integer>%d</integer></dict>' % t
+            for t in times) + '\n  </array>'
+    prog = ''.join('<string>%s</string>' % x for x in args)
     return """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -872,11 +894,10 @@ def _plist(hour, minute):
 <dict>
   <key>Label</key><string>%s</string>
   <key>ProgramArguments</key>
-  <array><string>/bin/bash</string><string>%s</string></array>
+  <array>%s</array>
   <key>WorkingDirectory</key><string>%s</string>
   <key>StartCalendarInterval</key>
-  <dict><key>Hour</key><integer>%d</integer>
-        <key>Minute</key><integer>%d</integer></dict>
+%s
   <key>StandardOutPath</key><string>%s</string>
   <key>StandardErrorPath</key><string>%s</string>
   <!-- 机器睡过了预定时刻，醒来补跑一次 —— 这正是不用 cron 的理由 -->
@@ -887,7 +908,7 @@ def _plist(hour, minute):
   <dict><key>PATH</key><string>%s</string></dict>
 </dict>
 </plist>
-""" % (LABEL, SH, ROOT, hour, minute, log, err, _sched_path())
+""" % (label, prog, ROOT, sched, log, err, _sched_path())
 
 
 def _verify_sched_env():
@@ -911,54 +932,98 @@ def _verify_sched_env():
     return True
 
 
-def install_timer(at='18:10'):
-    hh, mm = (int(x) for x in at.split(':'))
+def _times(spec):
+    """'07:00,08:00' -> [(7,0),(8,0)]。"""
+    out = []
+    for t in str(spec).split(','):
+        t = t.strip()
+        if not t:
+            continue
+        hh, mm = (int(x) for x in t.split(':'))
+        out.append((hh, mm))
+    if not out:
+        raise SystemExit('🔴 时间点解析不出来：%r' % spec)
+    return out
+
+
+def install_timer(at='18:10', tick_at=TICK_AT):
+    """装两个定时：数据同步（sync）与信号重算（tick）。
+
+    ★ 一起装是因为它们配套 —— 只装 sync 的话早上不会重算，
+      而"漏装了"的表现是**信号永远是昨晚 18:10 那份**，不报错。
+    """
     osname = platform.system()
     if not os.path.isfile(SH):
         raise SystemExit('🔴 找不到 %s' % SH)
+    if not os.path.isfile(TICK_PY):
+        raise SystemExit('🔴 找不到 %s' % TICK_PY)
     ok = _verify_sched_env()
+    JOBS = [
+        (LABEL, ['/bin/bash', SH], _times(at), 'sync', '数据同步'),
+        (TICK_LABEL, [sys.executable, TICK_PY], _times(tick_at), 'tick',
+         '信号重算'),
+    ]
     if osname == 'Darwin':
-        p = _launchd_path()
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        io.open(p, 'w', encoding='utf-8').write(_plist(hh, mm))
-        # ★ 先 unload 再 load：已加载时 load 会报错退出，而"报错了"
-        #   与"装没装上"是两件事 —— 判据永远是 launchctl list。
-        subprocess.run(['launchctl', 'unload', '-w', p],
-                       capture_output=True)
-        _run(['launchctl', 'load', '-w', p], check=False)
-        shutil.copyfile(p, os.path.join(ROOT, '_manifest', LABEL + '.plist'))
-        _say('✅ launchd 每日 %s；正本也更新到 _manifest/%s'
-             % (at, '' if ok else '　⚠️ 但环境自证没过，见上'))
+        for label, args, times, tag, what in JOBS:
+            p = _launchd_path(label)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            io.open(p, 'w', encoding='utf-8').write(
+                _plist(label, args, times, tag))
+            # ★ 先 unload 再 load：已加载时 load 会报错退出，而"报错了"
+            #   与"装没装上"是两件事 —— 判据永远是 launchctl list。
+            subprocess.run(['launchctl', 'unload', '-w', p],
+                           capture_output=True)
+            _run(['launchctl', 'load', '-w', p], check=False)
+            shutil.copyfile(p, os.path.join(ROOT, '_manifest',
+                                            label + '.plist'))
+            _say('✅ %s：每日 %s' % (what, ' / '.join(
+                '%02d:%02d' % t for t in times)))
+        # 🔴 判据是 launchctl 里到底有没有，不是上面几条命令的返回码
+        out = subprocess.run(['launchctl', 'list'], capture_output=True,
+                             text=True).stdout
+        for label, _a, _t, _g, what in JOBS:
+            _say('   %s %s' % ('✓' if label in out else '🔴 没装上',
+                               label))
+        if not ok:
+            _say('   ⚠️ 环境自证没过，见上')
+        _say('   正本也更新到 _manifest/')
     elif osname == 'Linux':
         d = os.path.expanduser('~/.config/systemd/user')
         os.makedirs(d, exist_ok=True)
-        io.open(os.path.join(d, 'finacial-sync.service'), 'w',
-                encoding='utf-8').write(
-            '[Unit]\nDescription=finacial 数据同步\n\n[Service]\n'
-            'Type=oneshot\nWorkingDirectory=%s\n'
-            # 🔴 同 launchd 那条：systemd 的环境也很窄，python3 会解析到
-            #   系统那个（没装 duckdb），2/6 PIT 快照就炸，而它漏一天不可逆
-            'Environment=PATH=%s\n'
-            'ExecStart=/bin/bash %s\n' % (ROOT, _sched_path(), SH))
-        io.open(os.path.join(d, 'finacial-sync.timer'), 'w',
-                encoding='utf-8').write(
-            '[Unit]\nDescription=每日 %s 跑数据同步\n\n[Timer]\n'
-            'OnCalendar=*-*-* %02d:%02d:00\n'
-            # ★ 机器在预定时刻睡着 -> 醒来补跑（launchd 天生如此，
-            #   systemd 要显式 Persistent=true，cron 则做不到）
-            'Persistent=true\n\n[Install]\nWantedBy=timers.target\n'
-            % (at, hh, mm))
-        _run(['systemctl', '--user', 'daemon-reload'], check=False)
-        _run(['systemctl', '--user', 'enable', '--now',
-              'finacial-sync.timer'], check=False)
-        _say('✅ systemd user timer 每日 %s（Persistent=true，睡过会补跑）'
-             % at)
+        for label, args, times, tag, what in JOBS:
+            unit = 'finacial-%s' % tag
+            io.open(os.path.join(d, unit + '.service'), 'w',
+                    encoding='utf-8').write(
+                '[Unit]\nDescription=finacial %s\n\n[Service]\n'
+                'Type=oneshot\nWorkingDirectory=%s\n'
+                # 🔴 同 launchd 那条：systemd 的环境也很窄，python3 会解析到
+                #   系统那个（没装 duckdb），2/6 PIT 快照就炸，漏一天不可逆
+                'Environment=PATH=%s\n'
+                'ExecStart=%s\n' % (what, ROOT, _sched_path(),
+                                     ' '.join(args)))
+            io.open(os.path.join(d, unit + '.timer'), 'w',
+                    encoding='utf-8').write(
+                '[Unit]\nDescription=%s\n\n[Timer]\n%s'
+                # ★ 机器在预定时刻睡着 -> 醒来补跑（launchd 天生如此，
+                #   systemd 要显式 Persistent=true，cron 则做不到）
+                'Persistent=true\n\n[Install]\nWantedBy=timers.target\n'
+                % (what, ''.join('OnCalendar=*-*-* %02d:%02d:00\n' % t
+                                 for t in times)))
+            _run(['systemctl', '--user', 'daemon-reload'], check=False)
+            _run(['systemctl', '--user', 'enable', '--now', unit + '.timer'],
+                 check=False)
+            _say('✅ %s：%s（Persistent=true，睡过会补跑）'
+                 % (what, ' / '.join('%02d:%02d' % t for t in times)))
         _say('   ⚠️ 要在没登录时也跑：sudo loginctl enable-linger $USER')
     elif osname == 'Windows':
-        _run(['schtasks', '/create', '/tn', 'finacial-sync', '/tr',
-              'bash "%s"' % SH, '/sc', 'daily', '/st', at, '/f'],
-             check=False)
-        _say('✅ 计划任务 finacial-sync 每日 %s' % at)
+        for label, args, times, tag, what in JOBS:
+            for hh, mm in times:
+                _run(['schtasks', '/create', '/tn',
+                      'finacial-%s-%02d%02d' % (tag, hh, mm), '/tr',
+                      ' '.join('"%s"' % x for x in args), '/sc', 'daily',
+                      '/st', '%02d:%02d' % (hh, mm), '/f'], check=False)
+            _say('✅ %s：%s' % (what, ' / '.join(
+                '%02d:%02d' % t for t in times)))
         _say('   ⚠️ sync_daily.sh 是 bash 脚本 —— Windows 上要有 '
              'Git Bash / WSL，且 tdx2db 要用 Windows 版')
     else:
@@ -969,15 +1034,19 @@ def install_timer(at='18:10'):
 def uninstall_timer():
     osname = platform.system()
     if osname == 'Darwin':
-        p = _launchd_path()
-        if os.path.isfile(p):
-            _run(['launchctl', 'unload', '-w', p], check=False)
-            os.remove(p)
+        for label in (LABEL, TICK_LABEL):
+            p = _launchd_path(label)
+            if os.path.isfile(p):
+                _run(['launchctl', 'unload', '-w', p], check=False)
+                os.remove(p)
     elif osname == 'Linux':
-        _run(['systemctl', '--user', 'disable', '--now',
-              'finacial-sync.timer'], check=False)
+        for tag in ('sync', 'tick'):
+            _run(['systemctl', '--user', 'disable', '--now',
+                  'finacial-%s.timer' % tag], check=False)
     elif osname == 'Windows':
         _run(['schtasks', '/delete', '/tn', 'finacial-sync', '/f'],
+             check=False)
+        _run(['schtasks', '/query', '/tn', 'finacial-tick-0700'],
              check=False)
     _say('🔴 关掉之后 daily_snapshot 就不跑了 —— 它【漏一天永久丢失】'
          '（tdx 的名称/分类/板块成分是 type-1 覆盖写）。')
@@ -999,7 +1068,10 @@ def main():
                     help='已有 vipdoc 就不重下重解')
     ap.add_argument('--sync', action='store_true', help='跑一次增量')
     ap.add_argument('--min', action='store_true', help='增量也抓 1 分钟线')
-    ap.add_argument('--install-timer', action='store_true', help='挂每日定时')
+    ap.add_argument('--install-timer', action='store_true',
+                    help='挂每日定时（数据同步 + 信号重算，两个一起）')
+    ap.add_argument('--tick-at', default=TICK_AT,
+                    help='信号重算的时间点，逗号分隔（默认 %s）' % TICK_AT)
     ap.add_argument('--at', default='18:10', help='定时时刻，默认 18:10')
     ap.add_argument('--uninstall-timer', action='store_true')
     a = ap.parse_args()
@@ -1011,7 +1083,7 @@ def main():
     if a.sync:
         return sync(minute=a.min)
     if a.install_timer:
-        return install_timer(at=a.at)
+        return install_timer(at=a.at, tick_at=a.tick_at)
     if a.uninstall_timer:
         return uninstall_timer()
     return check()
