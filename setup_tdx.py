@@ -794,7 +794,17 @@ LABEL = 'com.miraclegu.finacial.sync'
 #      18:10 那份算出来的清单可能与早上不一样（见 assay/tick_daily.py）。
 TICK_LABEL = 'com.miraclegu.finacial.tick'
 TICK_PY = os.path.join(os.path.dirname(ROOT), 'assay', 'tick_daily.py')
-TICK_AT = '07:00,08:00,09:00'
+# 定时窗口的**默认值**。真正生效的是 _manifest/schedule.json（看板可改）——
+# 见 load_schedule()。默认值只在配置文件不存在/读不了时用。
+DEFAULT_SCHED = {
+    'sync': {'from': '16:00', 'to': '20:00', 'every': 10},
+    'tick': {'from': '07:00', 'to': '09:20', 'every': 60},
+}
+SCHED_FILE = os.path.join(ROOT, '_manifest', 'schedule.json')
+# 合法区间。🔴 `every` 有下限是因为每个点位都是一次 launchd 唤醒 + 一次
+#   判据查询：写 1 分钟就是 240 个点位，而 plist 里点位越多、
+#   "改一个点位要改哪儿"就越不明显。上限则防手滑（写 0 会除零/死循环）。
+SCHED_LIMITS = {'every_min': 5, 'every_max': 240, 'max_slots': 100}
 # 数据同步改成**轮询**：16:00 起每 10 分钟问一次「齐没齐」，齐了就早退。
 #   判据在 build/is_stale.py（那里写了为什么不写死时间）。
 # ★ 这个序列恰好**包含 18:10**（16:00 + 10×13），所以原来那个独立的
@@ -802,7 +812,7 @@ TICK_AT = '07:00,08:00,09:00'
 # 🔴 而且第一个点位（16:00）必然判成"该跑"（那时今天的 PIT 快照与行情都
 #   还没抓），所以**完整链每个交易日至少跑一次** —— `daily_snapshot.py`
 #   漏一天永久丢失，这条保证不能靠"数据恰好齐了"。
-POLL_FROM, POLL_TO, POLL_EVERY = '16:00', '20:00', 10
+
 SH = os.path.join(ROOT, 'sync_daily.sh')
 
 
@@ -943,19 +953,122 @@ def _verify_sched_env():
     return True
 
 
+
+def _hhmm(t):
+    """'16:00' -> 分钟数。格式不对就抛，别猜。"""
+    try:
+        hh, mm = (int(x) for x in str(t).split(':'))
+    except Exception:
+        raise SystemExit('🔴 时间格式应是 HH:MM，实得 %r' % t)
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise SystemExit('🔴 时间超范围：%r' % t)
+    return hh * 60 + mm
+
+
+def check_schedule(sc):
+    """校验一份配置 -> (ok, 说明)。**写入前必须过这一关。**
+
+    🔴 不校验的后果不是"报错"，而是**装出一个不跑的 timer**：
+      `every=0` 会让点位生成死循环、`from > to` 会生成空数组，
+      而 launchd 对空的 StartCalendarInterval **不报错，只是永远不触发** ——
+      表现是"配好了但数据再也不同步了"，几天后才发现。
+    """
+    for k in ('sync', 'tick'):
+        d = (sc or {}).get(k)
+        if not isinstance(d, dict):
+            return False, '缺 %s 段' % k
+        try:
+            a, b = _hhmm(d.get('from')), _hhmm(d.get('to'))
+        except SystemExit as e:
+            return False, '%s：%s' % (k, e)
+        ev = d.get('every')
+        if not isinstance(ev, int) or isinstance(ev, bool):
+            return False, '%s.every 要是整数（分钟），实得 %r' % (k, ev)
+        lo, hi = SCHED_LIMITS['every_min'], SCHED_LIMITS['every_max']
+        if not (lo <= ev <= hi):
+            return False, '%s.every 要在 %d~%d 分钟之间，实得 %d' % (k, lo, hi, ev)
+        if a > b:
+            return False, '%s 的起点 %s 晚于终点 %s' % (k, d['from'], d['to'])
+        n = (b - a) // ev + 1
+        if n > SCHED_LIMITS['max_slots']:
+            return False, ('%s 会生成 %d 个点位，超过上限 %d —— '
+                           '把间隔调大或窗口缩短'
+                           % (k, n, SCHED_LIMITS['max_slots']))
+    return True, 'ok'
+
+
+def load_schedule():
+    """当前配置。读不了/不合法就退回默认值，并**说出来**。
+
+    ★ 退回默认而不是报错退出：定时任务的装配不该因为一个配置文件手滑而
+      整条停摆（那比"按默认跑"糟得多）。但必须打印原因 ——
+      静默退回等于"我改了配置却没生效"。
+    """
+    if not os.path.isfile(SCHED_FILE):
+        return dict(DEFAULT_SCHED), None
+    try:
+        sc = json.load(io.open(SCHED_FILE, encoding='utf-8'))
+    except Exception as e:                                      # noqa: BLE001
+        return dict(DEFAULT_SCHED), '读不了 %s（%s）—— 用默认值' % (
+            os.path.basename(SCHED_FILE), str(e)[:60])
+    ok, why = check_schedule(sc)
+    if not ok:
+        return dict(DEFAULT_SCHED), '配置不合法（%s）—— 用默认值' % why
+    return sc, None
+
+
+def save_schedule(sc):
+    """写配置。先校验、原子写 —— 半截文件会让下次装 timer 退回默认值。"""
+    ok, why = check_schedule(sc)
+    if not ok:
+        raise SystemExit('🔴 配置不合法：%s' % why)
+    os.makedirs(os.path.dirname(SCHED_FILE), exist_ok=True)
+    tmp = SCHED_FILE + '.tmp'
+    io.open(tmp, 'w', encoding='utf-8').write(
+        json.dumps(sc, ensure_ascii=False, indent=1))
+    os.replace(tmp, SCHED_FILE)
+    return sc
+
+
+def _parse_win(spec):
+    """'16:00-20:00/10' -> {'from':'16:00','to':'20:00','every':10}。
+
+    ★ 也接受单个时间 '18:10'（当成 from==to，一个点位）——
+      老命令 `--at 18:10` 因此仍然可用（"参数不认"是最糟的失败方式）。
+    """
+    spec = str(spec).strip()
+    every = None
+    if '/' in spec:
+        spec, e = spec.rsplit('/', 1)
+        every = int(e)
+    if '-' in spec:
+        a, b = spec.split('-', 1)
+    else:
+        a = b = spec
+    out = {'from': a.strip(), 'to': b.strip()}
+    if every is not None:
+        out['every'] = every
+    elif a.strip() == b.strip():
+        out['every'] = SCHED_LIMITS['every_min']   # 单点位，间隔无意义
+    return out
+
+
 def _range_times(start, end, step_min):
     """'16:00'~'20:00' 每 10 分钟 -> 25 个点位。
 
     ★ 用 StartCalendarInterval 的**数组**而不是 StartInterval（每 N 秒）：
       后者全天每 10 分钟唤醒一次（144 次），日志里全是"不在窗口内"。
     """
-    sh, sm = (int(x) for x in start.split(':'))
-    eh, em = (int(x) for x in end.split(':'))
-    t, last = sh * 60 + sm, eh * 60 + em
+    t, last = _hhmm(start), _hhmm(end)
     out = []
     while t <= last:
         out.append((t // 60, t % 60))
         t += step_min
+    # ★ 间隔除不尽时**补上终点**：07:00~09:20 每 60 分钟本来只到 09:00，
+    #   那 09:00~09:20 之间导入的数据要等到明天才会被算进去 ——
+    #   而"窗口写到 09:20"的意思就是"管到 09:20"。
+    if out and out[-1] != (last // 60, last % 60):
+        out.append((last // 60, last % 60))
     return out
 
 
@@ -973,7 +1086,51 @@ def _times(spec):
     return out
 
 
-def install_timer(at='18:10', tick_at=TICK_AT):
+def show_schedule():
+    """当前配置 vs **实际装上的点位** —— 两者必须一致。
+
+    🔴 只回显配置是不够的：配置改了而 timer 没重装时，
+      "页面上写着每小时一次、实际还是旧的"**不报错**。
+      所以判据是**已装的 plist 里到底有几个点位**
+      （同 CLAUDE.md：已安装的 plist 与仓库正本不一致要报出来）。
+    """
+    sc, warn = load_schedule()
+    out = {'schedule': sc, 'file': SCHED_FILE,
+           'exists': os.path.isfile(SCHED_FILE), 'warn': warn,
+           'limits': SCHED_LIMITS, 'installed': {}}
+    for key, label in (('sync', LABEL), ('tick', TICK_LABEL)):
+        d = sc[key]
+        want = _range_times(d['from'], d['to'], d['every'])
+        got, loaded, err = None, None, None
+        p = _launchd_path(label)
+        if platform.system() == 'Darwin' and os.path.isfile(p):
+            try:
+                import plistlib
+                pl = plistlib.load(io.open(p, 'rb'))
+                cal = pl.get('StartCalendarInterval')
+                cal = [cal] if isinstance(cal, dict) else (cal or [])
+                got = [(int(x.get('Hour', 0)), int(x.get('Minute', 0)))
+                       for x in cal]
+            except Exception as e:                              # noqa: BLE001
+                err = str(e)[:120]
+            try:
+                lst = subprocess.run(['launchctl', 'list'],
+                                     capture_output=True, text=True).stdout
+                loaded = label in lst
+            except Exception:                                   # noqa: BLE001
+                pass
+        out['installed'][key] = {
+            'label': label, 'want_slots': len(want),
+            'got_slots': (len(got) if got is not None else None),
+            'loaded': loaded, 'err': err,
+            'match': (got == want) if got is not None else None,
+            'first': ('%02d:%02d' % want[0]) if want else None,
+            'last': ('%02d:%02d' % want[-1]) if want else None,
+        }
+    return out
+
+
+def install_timer(at=None, tick_at=None):
     """装两个定时：数据同步（sync）与信号重算（tick）。
 
     ★ 一起装是因为它们配套 —— 只装 sync 的话早上不会重算，
@@ -985,15 +1142,34 @@ def install_timer(at='18:10', tick_at=TICK_AT):
     if not os.path.isfile(TICK_PY):
         raise SystemExit('🔴 找不到 %s' % TICK_PY)
     ok = _verify_sched_env()
+    # ★ 窗口从 _manifest/schedule.json 读（看板可改）；命令行的
+    #   --at / --tick-at 只是**临时覆盖**，不写回配置文件 ——
+    #   否则"命令行跑了一次"就悄悄改了长期配置。
+    sc, warn = load_schedule()
+    if warn:
+        _say('⚠️ %s' % warn)
+    if at:
+        sc = dict(sc, sync=dict(sc['sync'], **_parse_win(at)))
+    if tick_at:
+        sc = dict(sc, tick=dict(sc['tick'], **_parse_win(tick_at)))
+    ok, why = check_schedule(sc)
+    if not ok:
+        raise SystemExit('🔴 配置不合法：%s' % why)
     JOBS = [
         # 🔴 带 --if-stale：判据是"数据齐没齐"，不是"到点没到点"。
         #   齐了就秒退（连日志文件都不建），所以密集轮询的成本很低。
         (LABEL, ['/bin/bash', SH, '--if-stale'],
-         _range_times(POLL_FROM, POLL_TO, POLL_EVERY), 'sync',
-         '数据同步（%s~%s 每 %d 分钟轮询）'
-         % (POLL_FROM, POLL_TO, POLL_EVERY)),
-        (TICK_LABEL, [sys.executable, TICK_PY], _times(tick_at), 'tick',
-         '信号重算'),
+         _range_times(sc['sync']['from'], sc['sync']['to'],
+                      sc['sync']['every']), 'sync',
+         '数据同步（%s~%s 每 %d 分钟）'
+         % (sc['sync']['from'], sc['sync']['to'], sc['sync']['every'])),
+        # ★ tick 也是轮询：它的判据是"数据指纹变了吗"（tick_daily.py），
+        #   没变就跳过 —— 所以每小时问一次几乎没成本。
+        (TICK_LABEL, [sys.executable, TICK_PY],
+         _range_times(sc['tick']['from'], sc['tick']['to'],
+                      sc['tick']['every']), 'tick',
+         '信号重算（%s~%s 每 %d 分钟）'
+         % (sc['tick']['from'], sc['tick']['to'], sc['tick']['every'])),
     ]
     if osname == 'Darwin':
         for label, args, times, tag, what in JOBS:
@@ -1106,9 +1282,13 @@ def main():
     ap.add_argument('--min', action='store_true', help='增量也抓 1 分钟线')
     ap.add_argument('--install-timer', action='store_true',
                     help='挂每日定时（数据同步 + 信号重算，两个一起）')
-    ap.add_argument('--tick-at', default=TICK_AT,
-                    help='信号重算的时间点，逗号分隔（默认 %s）' % TICK_AT)
-    ap.add_argument('--at', default='18:10', help='定时时刻，默认 18:10')
+    ap.add_argument('--tick-at', default=None,
+                    help='临时覆盖信号重算窗口，如 07:00-09:20/60')
+    ap.add_argument('--schedule', action='store_true',
+                    help='打印当前窗口配置 + 实际装上的点位')
+    ap.add_argument('--set-schedule', metavar='JSON',
+                    help='写窗口配置（JSON），之后要 --install-timer 才生效')
+    ap.add_argument('--at', default=None, help='定时时刻，默认 18:10')
     ap.add_argument('--uninstall-timer', action='store_true')
     a = ap.parse_args()
     if a.install:
@@ -1118,6 +1298,14 @@ def main():
                          reuse_vipdoc=a.reuse_vipdoc)
     if a.sync:
         return sync(minute=a.min)
+    if a.schedule:
+        print(json.dumps(show_schedule(), ensure_ascii=False, indent=1,
+                         default=str))
+        return 0
+    if a.set_schedule:
+        save_schedule(json.loads(a.set_schedule))
+        _say('✅ 已写 %s —— 还要重装才生效：--install-timer' % SCHED_FILE)
+        return 0
     if a.install_timer:
         return install_timer(at=a.at, tick_at=a.tick_at)
     if a.uninstall_timer:
