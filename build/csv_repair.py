@@ -112,6 +112,17 @@ def read_forcast_df(path, verbose=True):
     import pandas as pd
     hdr, rows, st = read_repaired(path)
     df = pd.DataFrame(rows, columns=hdr)
+    # ★ **id 与 code 这两道是【冗余】的** —— 2026-09-11 变异测试证明的：
+    #   记录头判据 `^\d+,\d+,\d{6}\.XSH[EG],` 已经蕴含了它们，凡是能被切成
+    #   记录的行，第 1、3 段必然满足这两个正则。试着把 id 改成带字母、
+    #   把 code 后缀改错，那一行就**不再匹配记录头**、被当成续行吞掉，
+    #   压根进不了 DataFrame。所以这两道**永远不会触发**。
+    #   🔴 留着的理由只有一个：它们是判据与校验之间的**一致性断言** ——
+    #     哪天有人放松了 REC_START（比如退回 `^\d+,`），这两道会立刻响。
+    #     所以别删，但也别以为它们在防上游的脏数据。
+    #   ★ 真正起作用的是**下面那两道日期校验**：它们查第 11/12 段，
+    #     是记录头判据没覆盖的位置 —— 字段错位时唯一能发现的地方
+    #     （实测把一条续行伪装成记录头，id/code 仍合法，是 end_date 拦住的）。
     bad_id = int((~df['id'].str.fullmatch(r'\d+')).sum())
     if bad_id:
         raise ValueError('%s 有 %d 行 id 不是纯数字 —— 没修干净' % (path, bad_id))
