@@ -24,6 +24,7 @@
 并且不写任何文件 —— 宁可不合，也不能悄悄丢历史。
 """
 import argparse
+import datetime
 import os
 import re
 import shutil
@@ -278,6 +279,45 @@ CAL_DST = os.path.join(os.path.dirname(os.path.dirname(
     'trade_calendar.json')
 
 
+# 🔴 抽取端的元信息落这里 —— 它回答的是「**我什么时候导的**」，
+#   而不是「数据内容到哪天」。后者本地查 std/*.parquet 就有，
+#   前者**只有抽取端知道**（B 腿是事件驱动的，没公告时 pub_date 不前进，
+#   于是昨天刚导完也显示「距今 11 天」，看着像没更新）。
+MF_DST = os.path.join(ROOT, '_manifest', 'jq_extract.json')
+
+
+def _manifest(tmpd, dry, tarname=None):
+    """把包里的 `_manifest.json` 落到 `_manifest/jq_extract.json`。
+
+    ★ 老包没有这个文件 -> 静默跳过（不报错）：那些包是这个功能之前导的，
+      它们没有抽取时刻可言。页面上会显示「未知（该包是旧格式）」。
+    """
+    src = os.path.join(tmpd, '_manifest.json')
+    if not os.path.exists(src):
+        print('  %-30s （包里没有，旧格式包）' % '_manifest')
+        return
+    import json
+    d = json.load(open(src, encoding='utf-8'))
+    # ★ 记下**这次合并**的时刻也有用：包可能放几天才导，
+    #   「抽取于 09-10 20:26、合并于 09-11 08:00」两个都要看得见。
+    d['merged_at'] = datetime.datetime.now().strftime(
+        '%Y-%m-%d %H:%M:%S')
+    if tarname:
+        d['tar'] = os.path.basename(tarname)
+    if dry:
+        print('  %-30s [dry] 抽取于 %s，数据最新 %s'
+              % ('_manifest', d.get('extracted_at'), d.get('data_max_date')))
+        return
+    os.makedirs(os.path.dirname(MF_DST), exist_ok=True)
+    tmp = MF_DST + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, MF_DST)
+    print('  %-30s ✓ 抽取于 %s，数据最新 pub_date %s  -> %s'
+          % ('_manifest', d.get('extracted_at'), d.get('data_max_date'),
+             os.path.relpath(MF_DST)))
+
+
 def _calendar(tmpd, dry):
     src = os.path.join(tmpd, 'trade_calendar.json')
     if not os.path.exists(src):
@@ -325,6 +365,7 @@ def main():
     incs = sorted(f for f in os.listdir(tmpd)
                   if f.endswith('.csv.gz') or f.endswith('.parquet'))
     _calendar(tmpd, a.dry_run)
+    _manifest(tmpd, a.dry_run, a.tar)
     print('=' * 74)
     print('合并聚宽增量  %s%s' % (os.path.basename(a.tar), '  [dry-run]' if a.dry_run else ''))
     print('=' * 74)

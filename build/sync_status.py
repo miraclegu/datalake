@@ -123,8 +123,47 @@ def collect():
         'items': items,
         'leg_a_lag': max((i['lag_days'] for i in a), default=None),
         'leg_b_days_since': (today - bmax).days if bmax else None,
+        'extract': _extract_info(today),
         'mismatch': None,
     }
+
+
+def _extract_info(today):
+    """读 `_manifest/jq_extract.json` —— 「**上一次从聚宽抽数**是什么时候」。
+
+    🔴 **为什么必须单独一维**：B 腿是**事件驱动**的，没公告的日子 `pub_date`
+      不前进。于是「距今 11 天」这一个数**分不出两种情况**：
+        ① 你昨天刚导，只是这 11 天里没有新公告   <- 正常
+        ② 你两周没导了                          <- 要去导
+      用户原话：「实际上财务数据我昨天已经导入了最新的，但是上面的最新时间
+      不会更新，显得我好像没有更新一下。」
+    ★ 这个时点**只有抽取端知道**（聚宽研究环境跑脚本时的 now），本地无法
+      反推 —— 所以由 extract 脚本写进包、merge 时落到这里。
+    ★ 老包没有这个文件 -> 返回 None，页面显示「未知（旧格式包）」，
+      **不要猜**（比如拿文件 mtime 当抽取时刻 —— 那是下载/解压时刻）。
+    """
+    p = os.path.join(ROOT, '_manifest', 'jq_extract.json')
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding='utf-8') as f:
+            d = json.load(f)
+    except Exception:                                       # noqa: BLE001
+        return None
+    out = {'extracted_at': d.get('extracted_at'),
+           'extract_date': d.get('extract_date'),
+           'merged_at': d.get('merged_at'),
+           'data_max_date': d.get('data_max_date'),
+           'since': d.get('since'), 'tar': d.get('tar'),
+           'recovered': d.get('recovered')}
+    ed = (d.get('extract_date') or (d.get('extracted_at') or '')[:10])
+    if ed:
+        try:
+            out['days_since_extract'] = (
+                today - datetime.date.fromisoformat(ed)).days
+        except ValueError:
+            pass
+    return out
 
 
 def _fmt(st):
@@ -155,6 +194,37 @@ def _fmt(st):
     elif bd is not None:
         out.append('  B 腿（聚宽财务）距今 %d 天，正常（财务是事件驱动，'
                    '没公告就没有新 pub_date）' % bd)
+    # 🔴 **「上次抽取」要单独说一行。** 只看数据内容的话，「距今 11 天」
+    #   分不出「昨天刚导、只是没新公告」和「两周没导」—— 而这两件事
+    #   要做的动作完全相反。
+    ex = st.get('extract')
+    if ex is None:
+        out.append('  上次抽取 未知（包里没有 _manifest.json —— 旧格式包；'
+                   '下次导出会带上）')
+    else:
+        ds = ex.get('days_since_extract')
+        tag = '' if ds is None else (
+            '（今天）' if ds == 0 else '（%d 天前）' % ds)
+        # ★ 老包只恢复得出**日期**、没有时刻 —— 那就只写日期。
+        #   占位成 '?' 是噪声：它看着像"读出来是空的"，而其实是这个字段
+        #   当时根本没记。
+        when = ex.get('extracted_at') or ex.get('extract_date') or '未知'
+        line = '  上次抽取 %s%s' % (when, tag)
+        if ex.get('data_max_date'):
+            line += '   数据切到 pub_date %s' % ex['data_max_date']
+        if ex.get('since'):
+            line += '   SINCE=%s' % ex['since']
+        out.append(line)
+        if ex.get('recovered'):
+            out.append('    （%s）' % ex['recovered'])
+        if ex.get('merged_at'):
+            out.append('  本地合并 %s%s'
+                       % (ex['merged_at'],
+                          '   包 ' + ex['tar'] if ex.get('tar') else ''))
+        # ★ 告警判据换成**抽取时点**，而不是数据内容 —— 那才是"该不该去导"。
+        if ds is not None and ds > 14:
+            out.append('  🔴 已经 %d 天没从聚宽抽数了 —— 去研究环境跑 '
+                       'raw/jq/_ingest/extract_jq_increment.py' % ds)
     return '\n'.join(out)
 
 

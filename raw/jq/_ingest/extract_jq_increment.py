@@ -51,6 +51,7 @@ PAGE = 3000               # get_fundamentals 分页
 
 os.makedirs(OUT, exist_ok=True)
 _saved = []
+_stats = {}          # {表名: {rows, date_col, max_date, min_date}}
 
 
 def _save(name, df):
@@ -63,11 +64,33 @@ def _save(name, df):
     """
     if df is None or len(df) == 0:
         print('  [空] %s' % name)
+        _stats[name] = {'rows': 0}
         return
     p = os.path.join(OUT, name + '.csv.gz')
     df.to_csv(p, index=False, compression='gzip', encoding='utf-8')
     _saved.append(p)
-    print('  [OK] %-26s %7d 行  %.1f MB' % (name, len(df), os.path.getsize(p) / 1e6))
+    # 🔴 **记下这张表【实际抽到】的最大日期。**
+    #   为什么需要：B 腿（财务）是**事件驱动**的 —— 没公告的日子 pub_date
+    #   本来就不前进。于是 `sync_status` 只看数据内容时，昨天刚导完也显示
+    #   「距今 11 天」，看着像**没更新**（用户原话：「显得我好像没有更新」）。
+    #   ★ 「我什么时候导的」与「数据内容到哪天」是**两件事**，必须分开记。
+    #     前者只有抽取端知道（本地无法反推），所以要在包里带出来。
+    d = {'rows': int(len(df))}
+    for col in ('pub_date', 'board_plan_pub_date', 'change_date', 'end_date'):
+        if col in df.columns:
+            try:
+                s = df[col].dropna().astype(str)
+                if len(s):
+                    d['date_col'] = col
+                    d['max_date'] = str(s.max())[:10]
+                    d['min_date'] = str(s.min())[:10]
+            except Exception:                      # noqa: BLE001
+                pass
+            break
+    _stats[name] = d
+    print('  [OK] %-26s %7d 行  %.1f MB%s' % (
+        name, len(df), os.path.getsize(p) / 1e6,
+        ('  最大 %s=%s' % (d['date_col'], d['max_date'])) if 'max_date' in d else ''))
 
 
 def _chunks(xs, n):
@@ -200,8 +223,45 @@ def grab_calendar():
           % (len(days), len(fut), obj['max']))
 
 
+def _manifest():
+    """把「这一次抽取」的元信息写进包里 —— 本地无法反推，只有抽取端知道。
+
+    🔴 **为什么必须有它**：B 腿（财务）是**事件驱动**的，没公告的日子
+      `pub_date` 本来就不前进。于是 `build/sync_status.py` 只看数据内容时，
+      昨天刚导完也显示「距今 11 天」—— 看着像没更新。
+      「**我什么时候导的**」与「**数据内容到哪天**」是两件事：
+        · 后者在本地查得到（std/*.parquet 的 max(pub_date)）
+        · 前者**只有抽取端知道** —— 所以要在包里带出来
+    ★ `extracted_at` 用**聚宽服务器**的时间（研究环境跑这个脚本时的 now），
+      那就是"这份数据是什么时候从 JQ 拿的"。本地打包/解包时间不算 ——
+      包可能放几天才导。
+    ★ 同时记 `SINCE` 与每张表的 `max_date`：这样本地能判「这次抽取的窗口
+      是否覆盖了本地缺口」，而不是只能看行数。
+    """
+    obj = {
+        'extracted_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'extract_date': str(datetime.date.today()),
+        'since': SINCE,
+        'quarters': QUARTERS,
+        'tables': _stats,
+        # ★ 全局最大 pub_date —— 这就是"聚宽那边的数据切到哪天"
+        'data_max_date': max(
+            [v['max_date'] for v in _stats.values() if v.get('max_date')]
+            or ['']) or None,
+    }
+    p = os.path.join(OUT, '_manifest.json')
+    with open(p, 'w') as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+    _saved.append(p)
+    print()
+    print('  _manifest.json  抽取于 %s   数据最新 pub_date %s   SINCE=%s'
+          % (obj['extracted_at'], obj['data_max_date'], SINCE))
+    return obj
+
+
 # ---------------------------------------------------------------- 4 打包
 def pack():
+    mf = _manifest()
     ts = str(datetime.date.today()).replace('-', '')
     tar = os.path.join(OUT, 'jq_increment_%s.tar' % ts)
     with tarfile.open(tar, 'w') as t:
@@ -210,6 +270,8 @@ def pack():
     print()
     print('=' * 70)
     print('打包完成: %s  (%.1f MB)' % (tar, os.path.getsize(tar) / 1e6))
+    print('  抽取时刻 %s（聚宽服务器时间）' % mf['extracted_at'])
+    print('  数据最新 pub_date %s' % mf['data_max_date'])
     print('下载它，然后在本地跑：')
     print('    python3 datalake/build/merge_jq_increment.py <tar路径>')
     print('=' * 70)
