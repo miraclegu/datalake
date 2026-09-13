@@ -36,7 +36,12 @@ FAILURES = []
 INDEX_NAME = {'000300': ('沪深300', 300), '000905': ('中证500', 500),
               '000852': ('中证1000', 1000), '000906': ('中证800', 800),
               '000016': ('上证50', 50), '399006': ('创业板指', 100),
-              '000688': ('科创50', 50)}
+              '000688': ('科创50', 50),
+              # 🔴 sz=0 是有意的 —— 399101 是"综合指数"，成分数随市场扩容
+              # 天然增长(实测 2016~2026 从 776 涨到 958)，不是固定 N 只，
+              # 套用下面 ±15% 的规模校验会把正常增长误判成异常。
+              # sz 为 0/None 时那条 check 会自动跳过(见 main() 里的 `if sz and`)。
+              '399101': ('中小板综', 0)}
 
 
 def check(cond, msg):
@@ -74,6 +79,18 @@ def main():
         asof = pd.concat(parts, ignore_index=True)
         del parts
         asof['as_of'] = pd.to_datetime(asof['as_of'])
+        # 🔴 **按 (指数, 时点, 成分) 去重。** 抽取端是 CSV 追加写 + 进度文件，
+        #   进度文件若被删/丢失、或同一指数同时存在新旧两份不同频率的 CSV，
+        #   同一 (index, as_of, stock) 就会出现多行。实测（用假 jqdata 跑
+        #   extract_jq_index_members.py：删掉一半进度再跑）确实产生 106 行重复。
+        #   后果不是报错 —— 段压缩算法照样给出正确区间，但
+        #   `index_member_asof.parquet` 里成分数会翻倍，
+        #   任何"某日成分有几只"的统计都静默偏大。
+        n_raw = len(asof)
+        asof = asof.drop_duplicates(['index_code', 'as_of', 'stock_code'])
+        if len(asof) < n_raw:
+            print('  ⓘ 去重 %d 行重复 (%d -> %d)'
+                  % (n_raw - len(asof), n_raw, len(asof)))
         asof.to_parquet(os.path.join(L1, 'index_member_asof.parquet'),
                         index=False, compression='zstd')
 
@@ -218,11 +235,35 @@ def main():
             FROM index_member) WHERE prev >= valid_from""").fetchone()[0]
         check(ov == 0, '成分区间无重叠 (重叠 %d)' % ov)
 
-        # 成分股应都在证券全集里
+        # 成分股应都在证券全集里。
+        # 🔴 **北交所要单独拎出来，不能算失败** —— 这是聚宽免费账号自身的
+        #   不一致：`get_index_stocks` **会**返回北交所成分（中证2000 从 2024
+        #   起纳入北交所），而建 security_universe 用的 `get_all_securities`
+        #   **不返回**北交所（extract_jq_round2.py 文件头已实测记过这条）。
+        #   本地面板同样一行北交所行情都没有。
+        #   ★ 不特判的话这条校验【每次都红】，而"天天标红就不看红字了" ——
+        #     假告警会把真问题一起淹掉。但信息不能丢：单独报数量，
+        #     让"本地缺北交所"这件事一直看得见。
+        bj = con.execute("""SELECT count(DISTINCT m.stock_code) FROM index_member m
+            LEFT JOIN security_universe u ON u.code = m.stock_code
+            WHERE u.code IS NULL AND m.stock_code LIKE '%BJSE'""").fetchone()[0]
         miss = con.execute("""SELECT count(DISTINCT m.stock_code) FROM index_member m
             LEFT JOIN security_universe u ON u.code = m.stock_code
-            WHERE u.code IS NULL""").fetchone()[0]
-        check(miss == 0, '成分股全部在 security_universe 里 (缺 %d)' % miss)
+            WHERE u.code IS NULL AND m.stock_code NOT LIKE '%BJSE'""").fetchone()[0]
+        check(miss == 0, '成分股全部在 security_universe 里 (北交所之外缺 %d)' % miss)
+        if bj:
+            print('  ⓘ 另有 %d 只【北交所】成分不在 security_universe / 面板里 —— ' % bj)
+            print('     聚宽免费账号 get_all_securities 不含北交所，本地也没有它们的行情。')
+            print('     用到含北交所的指数(中证2000)做回测时，这部分会【静默缺席】：')
+            r = con.execute("""
+                WITH latest AS (SELECT max(as_of) d FROM index_member_asof
+                                WHERE index_code = '932000.CSI')
+                SELECT count(*), sum(CASE WHEN stock_code LIKE '%BJSE' THEN 1 ELSE 0 END)
+                FROM index_member_asof, latest
+                WHERE index_code = '932000.CSI' AND as_of = latest.d""").fetchone()
+            if r and r[0]:
+                print('     中证2000 最新一期 %d 只，其中北交所 %d 只 (%.1f%%)'
+                      % (r[0], r[1], 100.0 * r[1] / r[0]))
 
     if snap_all is not None:
         n_rt = con.execute('SELECT count(*) FROM fin_snapshots '

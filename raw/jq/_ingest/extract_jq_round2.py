@@ -5,7 +5,7 @@
 
 三段独立，可用下面的开关分次跑（额度或时间不够时分批）：
 
-  ① SEC_INDEX     指数成分历史 —— get_index_stocks(code, date=) 按季抽
+  ① SEC_INDEX     指数成分历史 —— **默认已关**，被 extract_jq_index_members.py 取代
                   现有 idx_weight_month 只有 1600 行且不完整(整数过滤 bug)。
                   实测 get_index_stocks 可回溯到 2005，无类型陷阱、无分页问题。
 
@@ -38,7 +38,8 @@ from jqdata import finance
 OUT = 'pitdb_r2'
 PAGE = 5000
 
-SEC_INDEX = True
+SEC_INDEX = False       # 🔴 已被 extract_jq_index_members.py 取代（见下方注释）
+                        #    想跑回旧的季频 7 指数才改回 True
 SEC_FINSNAP = True
 SEC_UNIVERSE = True
 
@@ -52,6 +53,13 @@ INDEXES = [
     ('399006.XSHE', '创业板指'),
     ('000688.XSHG', '科创50'),
 ]
+# 🔴 **① 段已被 extract_jq_index_members.py 取代**（2026-09-13）。
+#   那个脚本覆盖 28 个主要指数（本文件只有 7 个），且采样频率按指数性质分档：
+#   定期调整型月频、连续纳入型(中小板综/创业板综)周频 —— 本文件是一律季频。
+#   两边产出**同名文件** `index_member_<6位>.csv`，所以不要两个都跑：
+#   跑新的那个即可，它的产出会覆盖本段留下的季频文件。
+#   ★ 本文件的 ②(财务快照) ③(ETF/基金维度) 两段没有替代品，仍然要跑 ——
+#     所以把 SEC_INDEX 关掉再跑本文件，避免白花 7 个指数的额度。
 QUARTER_ENDS = ['%d-%s' % (y, md) for y in range(2005, 2027)
                 for md in ('03-31', '06-30', '09-30', '12-31')]
 
