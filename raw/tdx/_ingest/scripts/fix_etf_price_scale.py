@@ -60,12 +60,23 @@ def main(argv=None):
     if n == 0:
         print("✓ 无待修行, 跳过"); return 0
     if args.dry_run:
-        # 抽一只看修前/修后
-        s = todo["symbol"].iloc[0]
-        row = con.execute(f"""SELECT symbol, date, round(close,3) AS close_now,
-            round(close*{FACTOR},3) AS close_fixed FROM raw_kline_daily
-            WHERE symbol='{s}' AND date>=DATE '{args.cutoff}' ORDER BY date LIMIT 1""").df()
-        print("[DRY-RUN] 样例:\n" + row.to_string(index=False))
+        # 🔴 预览必须取【真正会被改的那一行】。
+        #   原来是先取一个 symbol，再查它 `date>=cutoff` 的**最早一行** ——
+        #   而那一行很可能早就修过、根本不在待修集合里。实测它显示
+        #   「sh501078 2026-05-25 2.89 -> 28.9」，看着像要把 5 月的数据再放大
+        #   一次，而实际待修的全是 09-01 之后。**预览说谎比没有预览更糟**：
+        #   人会照着它做"要不要执行"的决定。
+        print("[DRY-RUN] 待修区间: %s ~ %s"
+              % (todo["date"].min(), todo["date"].max()))
+        row = con.execute(f"""
+            SELECT k.symbol, k.date, round(k.close, 3) AS close_now,
+                   round(k.close * {FACTOR}, 3) AS close_fixed
+            FROM raw_kline_daily k
+            JOIN raw_symbol_class sc ON sc.symbol=k.symbol AND sc.class='etf'
+            {fixed_join}
+            WHERE k.date >= DATE '{args.cutoff}' {fixed_cond}
+            ORDER BY k.date, k.symbol LIMIT 3""").df()
+        print("[DRY-RUN] 样例(真实待修行):\n" + row.to_string(index=False))
         print("[DRY-RUN] 未写库")
         return 0
 

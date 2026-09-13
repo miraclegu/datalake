@@ -106,7 +106,12 @@ def main(argv=None):
         dates = [args.date]
     elif args.since:
         dates = [str(x[0]) for x in con.execute(
-            "SELECT DISTINCT date FROM raw_kline_daily WHERE date > DATE ? ORDER BY date",
+            # 🔴 `DATE ?` 不是合法 DuckDB 语法（DATE 后面只能跟字面量）。
+            #   原来这么写，于是 `--since` 这条路径**一跑就抛 ParserException**
+            #   —— 这个守卫从上线起就没真正体检过任何一天，而 2026-09-01 的
+            #   ETF 缩 10 倍正是它该拦下的那类问题。
+            "SELECT DISTINCT date FROM raw_kline_daily "
+            "WHERE date > CAST(? AS DATE) ORDER BY date",
             [args.since]).fetchall()]
     else:
         latest = con.execute("SELECT max(date) FROM raw_kline_daily").fetchone()[0]

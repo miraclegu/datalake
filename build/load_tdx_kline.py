@@ -254,14 +254,33 @@ def main():
                      "WHERE dayofweek(date) IN (0,6)").fetchone()[0]
     check(wk == 0, '交易日历无周末 (异常 %d)' % wk)
 
-    # 刻度突变检测(2026-05-25 ETF ×10 事件应已被 tdx 侧修复)
+    # 刻度突变检测：**全区间扫，不钉在某一天**。
+    # 🔴 原来这条写死了 `date BETWEEN '2026-05-15' AND '2026-06-05'`（只看
+    #   2026-05-25 那次事件的前后三周）。于是同一类问题 **2026-09-01 又发生一次**
+    #   （1566 只真 ETF 价格整体 ÷10 并冻结）时，它一声不吭地报"异常 0"。
+    #   ★ 守卫要检测**现象**，不是检测**那一次事故的日期** —— 钉死日期的守卫
+    #     只能证明历史那次修好了，对下一次完全无效，而它看着还一直是绿的。
+    # ★ 判据：同一天有 >= 50 只 ETF 单日 |收益| > 50%。个别标的的真实暴涨跌
+    #   （如分级折算）不会触发；单位/编码整体变更必然触发。
     j = con.execute("""
         WITH p AS (SELECT k.symbol, k.date, k.close,
                           lag(k.close) OVER (PARTITION BY k.symbol ORDER BY k.date) pc
                    FROM kline_raw k JOIN code_map m ON m.tdx_symbol=k.symbol
-                   WHERE m.class='etf' AND k.date BETWEEN DATE '2026-05-15' AND DATE '2026-06-05')
-        SELECT count(*) FROM p WHERE pc>0 AND (close/pc > 5 OR close/pc < 0.2)""").fetchone()[0]
-    check(j == 0, 'ETF 在 2026-05-25 附近无 10 倍刻度跳变 (异常 %d)' % j)
+                   WHERE m.class='etf')
+        SELECT count(*) FROM (
+            SELECT date FROM p WHERE pc > 0 AND (close/pc > 2 OR close/pc < 0.5)
+            GROUP BY date HAVING count(*) >= 50)""").fetchone()[0]
+    bad_days = con.execute("""
+        WITH p AS (SELECT k.symbol, k.date, k.close,
+                          lag(k.close) OVER (PARTITION BY k.symbol ORDER BY k.date) pc
+                   FROM kline_raw k JOIN code_map m ON m.tdx_symbol=k.symbol
+                   WHERE m.class='etf')
+        SELECT date::VARCHAR, count(*) FROM p
+        WHERE pc > 0 AND (close/pc > 2 OR close/pc < 0.5)
+        GROUP BY date HAVING count(*) >= 50 ORDER BY date""").fetchall() if j else []
+    check(j == 0, 'ETF 全区间无刻度集体跳变 (异常日 %d%s)'
+          % (j, ('：' + '、'.join('%s(%d只)' % (d, n) for d, n in bad_days[:5]))
+             if bad_days else ''))
 
     # ------------------------------------------------------------------ 演示
     if args.demo:

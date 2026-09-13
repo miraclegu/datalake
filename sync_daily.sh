@@ -106,20 +106,48 @@ say "======================================================================"
 #   而且 datalake 只用 tdx.db 的 raw_kline_daily / raw_adjust_factor /
 #   raw_basic_daily / raw_symbol_class 四张表（load_tdx_kline.py 里查得到），
 #   技术指标那步与本链无关。所以直接调 tdx2db cron。
-run "1/6 tdx2db cron（抓日线+复权因子）" "$TDX" ./tdx2db cron --dburi "duckdb://./tdx.db"
+run "1/8 tdx2db cron（抓日线+复权因子）" "$TDX" ./tdx2db cron --dburi "duckdb://./tdx.db"
 
 # ★ 这一步【漏一天永久丢失】，所以即使前面失败也要跑：它读的是 tdx.db
 #   的当前状态，与 cron 是否成功无关。
-run "2/6 PIT 快照（漏一天不可逆）" "$TDX" python3 daily_snapshot.py
+run "2/8 PIT 快照（漏一天不可逆）" "$TDX" python3 daily_snapshot.py
+
+# 🔴🔴 ETF 价格刻度修正 —— **必须每天跑，且必须在 load_tdx_kline 之前**。
+#
+# 通达信 2026-05-25 改了 ETF 的价格编码，而 tdx2db 的二进制解析没跟上：
+# 抓进来的 ETF 价格一律是真实值的 **1/10**（amount 是对的、volume 大 10 倍，
+# 拿 `volume/100 × close ≈ amount` 一算就能确认是价格错而不是市场跌）。
+#
+# 这个脚本早就存在，但**从来没接进任何一条链** —— 一直靠人记得手动跑。
+# 2026-08-31 之后就没人跑了，于是 09-01 ~ 09-11 共 18,909 行 ETF 价格
+# 全部偏小 10 倍（1566 只真 ETF，占 88.5%），而下游**一路静默**：
+# datalake 如实复制、面板如实构建、ETF 回测直接给出 -90% 的假暴跌。
+# ★ 靠人记得跑的步骤 = 迟早不跑。判据要写进链条，不是写进文档。
+#
+# 幂等：已修的 (symbol,date) 记在 `_etf_scale_fixed` 里，重复跑不会二次放大。
+# ⚠️ 将来 tdx2db 换成修复版二进制（直接产出正确 ETF 价）后**必须删掉这一步**，
+#    否则会把正确数据再 ×10 —— 下面那步体检会当场拦下（它查的是"有没有
+#    大批标的单日暴跌/暴涨"，×10 与 ÷10 都会触发）。
+run "3/8 ETF 价格刻度修正（tdx 编码变更的补丁）" "$TDX" \
+    python3 scripts/fix_etf_price_scale.py --db ./tdx.db
+
+# 🔴 更新体检 —— 上一步的**守卫**，也是整条 A 腿的守卫。
+#   查"某天大批标的价格/量/额整体跳变"（单位或编码变更的指纹）。
+#   失败即进 STEPS_BAD -> 下面 5~8 步整体跳过，**不在坏数据上继续加工**。
+#   ★ 它本来就是为 2026-05-25 那次写的，但同样没接进链；而且 `--since`
+#     那条路径有个 `DATE ?` 的语法错误，一跑就抛 ParserException ——
+#     也就是说这个守卫从上线起就没体检过任何一天。已一并修好。
+run "4/8 更新体检（大批跳变即中止）" "$TDX" \
+    python3 scripts/check_data_anomaly.py --db ./tdx.db --since "$(date -v-10d +%F 2>/dev/null || date -d '10 days ago' +%F)"
 
 if [ ${#STEPS_BAD[@]} -eq 0 ]; then
-  run "3/6 tdx -> raw/std" "$ROOT" python3 datalake/build/load_tdx_kline.py \
-    && run "4/6 交易日历（含未来，带对数）" "$ROOT" python3 datalake/build/build_trade_calendar.py \
-    && run "5/6 面板（本年增量）" "$ROOT" python3 datalake/build/build_panel_daily.py --year "$(date +%Y)" \
-    && run "6/6 beta" "$ROOT" python3 datalake/build/build_beta_daily.py
+  run "5/8 tdx -> raw/std" "$ROOT" python3 datalake/build/load_tdx_kline.py \
+    && run "6/8 交易日历（含未来，带对数）" "$ROOT" python3 datalake/build/build_trade_calendar.py \
+    && run "7/8 面板（本年增量）" "$ROOT" python3 datalake/build/build_panel_daily.py --year "$(date +%Y)" \
+    && run "8/8 beta" "$ROOT" python3 datalake/build/build_beta_daily.py
 else
   say ""
-  say "⚠ 前置步骤失败，跳过 3~6（不在坏数据上继续加工）"
+  say "⚠ 前置步骤失败，跳过 5~8（不在坏数据上继续加工）"
 fi
 
 # ---- 新鲜度 + B 腿落后多少 ----
