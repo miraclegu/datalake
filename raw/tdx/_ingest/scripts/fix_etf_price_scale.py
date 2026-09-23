@@ -32,7 +32,33 @@ def main(argv=None):
     ap.add_argument("--db", required=True)
     ap.add_argument("--cutoff", default=CUTOFF, help=f"起始日期(默认 {CUTOFF})")
     ap.add_argument("--dry-run", action="store_true", help="只统计不写库")
+    ap.add_argument("--i-know-this-is-retired", action="store_true",
+                    help="已退役，见下方说明；不带这个参数一律拒绝执行")
     args = ap.parse_args(argv)
+
+    # 🔴🔴 2026-09-17 退役 —— 这个补丁补在错误的层上，现在会【损坏】数据。
+    #
+    # 当初的定性是"通达信 2026-05-25 改了 ETF 价格编码"。那是错的：
+    # `.day` 正本的编码从来没变过（sz159525：05-22=1079、05-25=1077，连续）。
+    # 真正坏的是 tdx2db 的【每日增量】那条路径（g4day），它把 ETF 价格按
+    # ÷10000 再舍到 3 位 —— 于是 `1107`（真值 1.107×1000）进库成了 `0.111`：
+    # 量级小 10 倍，**而且第 3 位小数被舍掉了**。
+    #
+    # ×10 只还原量级，那一位回不来。实测后果：ETF 相邻交易日收盘完全相同的
+    # 占比从 3~4% 涨到 30.9%（红利低波那几只 40%+），页面上看着像"没同步"。
+    #
+    # 取代它的是 `fix_etf_price_from_dayfile.py`（直接取 .day 正本，带三道自证），
+    # 已接进 sync_daily.sh 的 3/8。
+    #
+    # ⚠️ 这里必须**硬拒**而不是只在文档里写一句：价格已经是正确值了，
+    #    再跑一次就是 ×10，而下游一路静默（同当初那次 -90% 假暴跌）。
+    if not args.i_know_this_is_retired:
+        print(__doc__.strip().splitlines()[0])
+        print('')
+        print('❌ 这个脚本已于 2026-09-17 退役 —— 再跑会把【已经正确】的 ETF 价格 ×10。')
+        print('   改用：python3 scripts/fix_etf_price_from_dayfile.py --db %s' % args.db)
+        print('   （保留本文件只为留住这段历史与当初的推导；真要跑加 --i-know-this-is-retired）')
+        return 2
 
     con = duckdb.connect(args.db, read_only=args.dry_run)
 
