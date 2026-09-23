@@ -137,14 +137,24 @@ def ref_hlc(bars, tr, fid):
 
 def main():
     import duckdb
+    from factors import load
     g = os.path.join(DL, 'mart', 'panel_daily', 'panel_*.parquet')
-    df = duckdb.connect(':memory:').execute("""
-        SELECT jq_code, date, close_hfq, close_bfq, open, high, low, preclose,
-               hfq_factor, volume_shares, amount, turnover
-        FROM read_parquet('%s') WHERE jq_code IN %s AND date >= DATE '%s'
-        ORDER BY jq_code, date""" % (g, CODES, SINCE)).df()
+    # ★ 走取数正本 —— 自己拼 SELECT 的话，加一族因子就会与落盘那条路分叉
+    #   （这个文件就这么坏过一次）。
+    df = load.chunk_df(duckdb.connect(':memory:'), g, DL, CODES,
+                       where="date >= DATE '%s'" % SINCE)
     x = Ctx(df)
-    V = {s.id: np.asarray(s.calc(x), dtype='float64') for s in all_specs()}
+    # 🔴 **只算这一条用例要比的那几个**，不是 all_specs()。
+    #   加了财务族之后 `all_specs()` 里有 64 条要 `b_*` / `t_*` 列，
+    #   而这里的 Ctx 只喂了面板列 —— 全算会 NameError 直接崩。
+    #   ⚠ 这个 bug 是加财务因子那一轮引入的，而**直到把守卫接进 selftest
+    #     才被发现**（上次跑它是在加财务因子之前）。正是
+    #     「靠人记得跑的步骤 = 迟早不跑」。
+    want = set(FIDS)
+    V = {s.id: np.asarray(s.calc(x), dtype='float64')
+         for s in all_specs() if s.id in want}
+    miss = want - set(V)
+    assert not miss, '注册表里没有这几个因子，对数清单过期了: %s' % sorted(miss)
     D = x.df
     print('样本 %d 行 / %d 只 / %s 起' % (len(D), D.jq_code.nunique(), SINCE))
     print('判据：与 indicators.py 内部函数逐值比，**相对**误差 < %g\n' % RTOL)

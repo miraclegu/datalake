@@ -67,23 +67,8 @@ PANEL = os.path.join(DL, 'mart', 'panel_daily', 'panel_*.parquet')
 CHUNK = 700
 
 
-def _panel_has(con):
-    return set(d[0] for d in con.execute(
-        "SELECT * FROM read_parquet('%s') LIMIT 0" % PANEL).description)
-
-
-def _cols(con):
-    """要从**面板**读哪几列 —— 取各 Spec 的 `deps` 并集再与面板列求交。
-
-    ★ 写死的话加一个用到新列的因子会静默读不到（更糟的是拿到全 NaN）。
-    🔴 求交这一步不能省：财务因子的 `deps` 里是 `b_total_assets` 这类
-      **as-of 贴上来的**列，面板里没有 —— 直接 SELECT 会报"没有这一列"。
-    """
-    have = _panel_has(con)
-    need = {'jq_code', 'date'}
-    for s in all_specs():
-        need |= {c for c in s.deps if c in have}
-    return sorted(need)
+# ★ 取数那一步搬进了 `factors/load.py`（唯一正本）—— 原本这里与
+#   `factor_try` 各写一份，加财务族之后两份同时坏、坏法还一样。
 
 
 def _spec_sig():
@@ -113,13 +98,7 @@ def _codes(con):
 
 def _chunk_frame(con, codes):
     """一块股票的【全历史】+ 98 个因子 -> DataFrame。"""
-    q = ', '.join("'%s'" % c for c in codes)
-    sub = ("SELECT %s FROM read_parquet('%s') WHERE jq_code IN (%s)"
-           % (', '.join(_cols(con)), PANEL, q))
-    # 🔴 财务列由 as-of 贴上来（`pub_date <= date`，用 report_date 就是
-    #   未来函数）。实测两年全市场 340 万行 0.1 秒，所以**总是**贴 ——
-    #   "有财务因子才贴"要多一个开关，而开关忘了开的表现是那批因子整列为空。
-    df = con.execute(fin.asof_sql(DL, sub)).df()
+    df = load.chunk_df(con, PANEL, DL, codes)
     if df.empty:
         return None
     x = Ctx(df)
@@ -276,7 +255,7 @@ def main():
 
 sys.path.insert(0, HERE)
 from factors import Ctx, all_specs                          # noqa: E402,E731
-from factors import fin                                     # noqa: E402
+from factors import load                                    # noqa: E402
 
 if __name__ == '__main__':
     raise SystemExit(main())

@@ -58,6 +58,7 @@ FDIR = os.path.join(DL, 'mart', 'factor_daily')
 
 sys.path.insert(0, HERE)
 from factors import Ctx, all_specs, GROUPS                  # noqa: E402
+from factors import load                                    # noqa: E402
 
 # ★ 求值器、列别名、算子表**全在 factors/expr.py** —— 这里一行都不重写。
 #   两边各写一个的话，"试的时候是这个数、进面板变成另一个"迟早发生
@@ -66,13 +67,12 @@ from factors.expr import ALIAS, OPS, PT, evaluate, deps_of, warm_of  # noqa: E40
 
 
 def _load(con, codes=None):
-    need = sorted({'jq_code', 'date'} | {c for s in all_specs() for c in s.deps})
-    w = []
-    if codes:
-        w.append('jq_code IN (%s)' % ', '.join("'%s'" % c for c in codes))
-    sql = "SELECT %s FROM read_parquet('%s')%s" % (
-        ', '.join(need), PANEL, (' WHERE ' + ' AND '.join(w)) if w else '')
-    return con.execute(sql).df()
+    """★ 转发给 `factors/load.py` —— 取数只有一份实现。
+
+    原来这里自己拼列名，加财务族之后 `deps` 里出现了 as-of 才有的
+    `b_*` 列，SELECT 当场报"没有这一列"，**而 `--selftest` 因此整条挂掉**。
+    """
+    return load.chunk_df(con, PANEL, DL, codes)
 
 
 def _chunks(con, chunk):
