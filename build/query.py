@@ -127,6 +127,8 @@ def run(sql, limit=DEFAULT_LIMIT):
 PARQUET = [
     ('panel_daily', 'mart/panel_daily/panel_*.parquet', '日频面板（71 列，回测直接吃这张）'),
     ('paused_daily', 'mart/paused_daily/*.parquet', '停牌（稀疏：未出现=未停牌）'),
+    ('factor_catalog', 'mart/factor_catalog.parquet',
+     '因子目录：编号/中文名/公式/说明/单位/可信度。🔴 tier=own 是【自建定义】不是聚宽那个因子'),
 ]
 
 
