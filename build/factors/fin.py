@@ -139,7 +139,23 @@ def asof_sql(root, panel_sub):
             + [PFX_TTM + f for f in list(INC) + list(CFL)]
             + [PFX_CUM + f for f in list(INC) + list(CFL)])
     return """
-    WITH fq AS (%s)
+    WITH fq0 AS (%s),
+    -- 🔴🔴 **同一 (code, pub_date) 只留报告期最新的那条。**
+    --
+    --   实测有 **24,032 组**「年报与一季报同一天披露」（4 月 28~30 日是常态，
+    --   例：000033 在 2015-04-30 同时披露 2014 年报与 2015 一季报）。
+    --   ASOF 在 `pub_date` 并列时**任选一条** —— 选哪条取决于 duckdb 的
+    --   扫描顺序，于是同一天的因子值**跨进程/跨分块会变**。
+    --   实测：`--check`（块 700 -> 233）报出 11.7%% 的行不等，
+    --   而它**不报错**（数都在合理范围里）。
+    --   与 froec 那条 `ORDER BY r.increase DESC` 没有 tie-break 是同一类。
+    --
+    -- ★ 取 report_date 最大的那条**同时也是正确语义**：同日披露时，
+    --   一季报比上年年报新，as-of 当然该用新的。
+    fq AS (
+      SELECT * FROM fq0
+      QUALIFY row_number() OVER (PARTITION BY code, pub_date
+                                 ORDER BY report_date DESC) = 1)
     SELECT p.*, %s, fq.report_date AS fin_rd, fq.pub_date AS fin_pd
     FROM (%s) p
     ASOF LEFT JOIN fq ON fq.code = p.jq_code AND fq.pub_date <= p.date
