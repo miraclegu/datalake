@@ -48,6 +48,21 @@ import pandas as pd
 
 WARM_FLOOR = 120
 
+#: 🔴🔴 **横截面不可比的单位** —— 这几种单位的因子，"排第几"排的是量纲不是信号。
+#:
+#:   元    后复权价。而 `hfq_factor` 跨票从 **1.00 到 5899.9**（实测 2026-09-22
+#:         全市场），所以 `ma20` 的横截面排序 = 排「股价 × 上市以来分红拆细」。
+#:         实测它与不复权股价秩相关 +0.536、与复权因子 +0.421 —— 两个混淆项
+#:         加起来就是它的全部内容。
+#:   股    成交量水平。大盘股天然成交几亿股，小盘股几百万。
+#:   元/天 回归斜率。20 元的票涨 1% 是 0.2 元/天，2000 元的票是 20 元/天。
+#:
+#: 这不是说这些因子没用 —— 它们**时序上**有意义（这只票今天的 MA20 比上月高）。
+#: 不能做的是**拿它直接做横截面排序**：要么先除以价格/成交额，要么做市值中性化。
+#: 🔴 而它**不报错** —— IC 照样算得出来，只是算的是量纲。实测本地 98 个因子
+#:   与 `factors.xlsx` 的 IC 符号有 19 个对不上，**全部**落在这几种单位里。
+ABS_UNITS = ('元', '股', '元/天')
+
 TIERS = {
     'exact': '✅✅ 逐只实测定案',
     'std':   '✅ 行业标准/会计定义，无歧义',
@@ -61,6 +76,10 @@ GROUPS = {
     'osc':  '摆动 / 超买超卖',
     'vol':  '量能 / 资金流',
     'turn': '换手率',
+    'lev':  '偿债 / 杠杆 / 结构',
+    'val':  '市值 / 估值',
+    'ttm':  'TTM 金额',
+    'cfq':  '现金流质量',
 }
 
 
@@ -104,6 +123,15 @@ class Spec(object):
         self.tier, self.note, self.src_dup = tier, note, bool(src_dup)
 
     @property
+    def xs_comparable(self):
+        """这个因子的值**能不能跨股票直接比大小**（= 能不能做横截面排序）。
+
+        判据就是单位 —— 见 `ABS_UNITS` 那段。做成属性而不是在两处各判一次：
+        目录表与评价层都读它，分叉的话会出现「目录说可比、评价说不可比」。
+        """
+        return self.unit not in ABS_UNITS
+
+    @property
     def warm_eff(self):
         return max(self.warm, WARM_FLOOR)
 
@@ -122,6 +150,7 @@ class Spec(object):
             'deps': ','.join(self.deps),
             'warm': self.warm,
             'warm_eff': self.warm_eff,
+            'xs_comparable': self.xs_comparable,
             'note': self.note,
             'src_dup': self.src_dup,
         }
@@ -371,6 +400,7 @@ def register(specs):
 
 def _load():
     from . import ma, pos, dist, turn, vol, osc      # noqa: F401  注册副作用
+    from . import fin_lev, fin_ttm                  # noqa: F401  财务族
     return FACTORS
 
 

@@ -61,7 +61,15 @@ OPS = {
 #: 逐点函数（不涉及窗口）
 PT = {'abs': np.abs, 'log': np.log, 'sqrt': np.sqrt, 'sign': np.sign,
       'exp': np.exp, 'maximum': np.maximum, 'minimum': np.minimum,
-      'where': np.where, 'clip': np.clip}
+      'where': np.where, 'clip': np.clip,
+      # 🔴 `z(x)` = 缺失按 0 —— **只用在【求和项】上**。
+      #   资产负债表的明细行（应付债券、长期借款…）在公司没有这项业务时
+      #   本来就是空的，直接相加会让 NULL 传染掉整个和：实测「净债务」
+      #   非空率因此只有 **17.7%**（四个明细行的交集）。
+      #   ⚠ 反过来**不许用在分母或比率的主项上** —— 那里的空是"不知道"，
+      #     按 0 算会把"没披露"变成一个看着正常的数（同「拿不到分红那一格
+      #     标查不到，不猜一个数」）。
+      'z': lambda v: np.nan_to_num(np.asarray(v, dtype='float64'), nan=0.0)}
 
 
 class _Env(object):
@@ -91,6 +99,11 @@ class _Env(object):
 
     def ns(self):
         g = {'__builtins__': {}}
+        # 🔴 **先放列、后放算子** —— 反过来的话，哪天有个列叫 `ma`
+        #   就会把算子顶掉，而表达式照样"跑得通"、只是算的是那一列。
+        for c in self.x.df.columns:
+            if not c.startswith('_expr'):
+                g[c] = self.x.col(c)
         for short, real in ALIAS.items():
             g[short] = self.x.col(real) if real in self.x.df.columns else None
         for name, meth in OPS.items():
@@ -144,9 +157,15 @@ def deps_of(e):
     """
     out = set()
     for n in ast.walk(ast.parse(e, mode='eval')):
-        if isinstance(n, ast.Name) and n.id in ALIAS:
-            real = ALIAS[n.id]
-            out |= set(SRC.get(real, (real,)))
+        if not isinstance(n, ast.Name) or n.id in OPS or n.id in PT:
+            continue
+        if n.id in ALIAS:
+            out |= set(SRC.get(ALIAS[n.id], (ALIAS[n.id],)))
+        elif n.id.startswith(('b_', 't_', 'c_')) or n.id in ('totalmv', 'floatmv'):
+            # 财务列（as-of 贴上来的）与市值列按原名走。
+            # ★ 建面板时 `_cols()` 只把**面板真有的**列拿去 SELECT，
+            #   财务列由 as-of 自带 —— 混在一起 SELECT 会直接报"没有这一列"。
+            out.add(n.id)
     return tuple(sorted(out))
 
 

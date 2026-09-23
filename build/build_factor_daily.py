@@ -67,14 +67,22 @@ PANEL = os.path.join(DL, 'mart', 'panel_daily', 'panel_*.parquet')
 CHUNK = 700
 
 
-def _cols():
-    """要读哪几列 —— 取各 Spec 的 `deps` 并集，不写死。
+def _panel_has(con):
+    return set(d[0] for d in con.execute(
+        "SELECT * FROM read_parquet('%s') LIMIT 0" % PANEL).description)
+
+
+def _cols(con):
+    """要从**面板**读哪几列 —— 取各 Spec 的 `deps` 并集再与面板列求交。
 
     ★ 写死的话加一个用到新列的因子会静默读不到（更糟的是拿到全 NaN）。
+    🔴 求交这一步不能省：财务因子的 `deps` 里是 `b_total_assets` 这类
+      **as-of 贴上来的**列，面板里没有 —— 直接 SELECT 会报"没有这一列"。
     """
+    have = _panel_has(con)
     need = {'jq_code', 'date'}
     for s in all_specs():
-        need |= set(s.deps)
+        need |= {c for c in s.deps if c in have}
     return sorted(need)
 
 
@@ -106,15 +114,21 @@ def _codes(con):
 def _chunk_frame(con, codes):
     """一块股票的【全历史】+ 98 个因子 -> DataFrame。"""
     q = ', '.join("'%s'" % c for c in codes)
-    df = con.execute("SELECT %s FROM read_parquet('%s') WHERE jq_code IN (%s)"
-                     % (', '.join(_cols()), PANEL, q)).df()
+    sub = ("SELECT %s FROM read_parquet('%s') WHERE jq_code IN (%s)"
+           % (', '.join(_cols(con)), PANEL, q))
+    # 🔴 财务列由 as-of 贴上来（`pub_date <= date`，用 report_date 就是
+    #   未来函数）。实测两年全市场 340 万行 0.1 秒，所以**总是**贴 ——
+    #   "有财务因子才贴"要多一个开关，而开关忘了开的表现是那批因子整列为空。
+    df = con.execute(fin.asof_sql(DL, sub)).df()
     if df.empty:
         return None
     x = Ctx(df)
-    out = x.df[['jq_code', 'date']].copy()
-    for s in all_specs():
-        out[s.id] = np.asarray(s.calc(x), dtype='float32')
-    return out
+    # ★ 一次 concat 而不是逐列 insert —— 逐列插 161 次会让 pandas 反复
+    #   重排内存（它自己会打 PerformanceWarning），而那串告警会把真正的
+    #   输出淹掉。
+    cols = {s.id: np.asarray(s.calc(x), dtype='float32') for s in all_specs()}
+    return pd.concat([x.df[['jq_code', 'date']].reset_index(drop=True),
+                      pd.DataFrame(cols)], axis=1)
 
 
 def build(con, chunk=CHUNK, out_dir=OUT, quiet=False):
@@ -262,6 +276,7 @@ def main():
 
 sys.path.insert(0, HERE)
 from factors import Ctx, all_specs                          # noqa: E402,E731
+from factors import fin                                     # noqa: E402
 
 if __name__ == '__main__':
     raise SystemExit(main())

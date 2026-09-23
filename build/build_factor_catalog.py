@@ -79,7 +79,8 @@ def build():
     df = pd.DataFrame(rows, columns=[
         'factor_id', 'name_cn', 'group_key', 'group_cn',
         'formula', 'desc', 'unit', 'tier', 'tier_cn',
-        'deps', 'warm', 'warm_eff', 'note', 'src_dup', 'src_row'])
+        'deps', 'warm', 'warm_eff', 'xs_comparable', 'note',
+        'src_dup', 'src_row'])
     # src_row 可能有缺 -> 可空整数，不要变成 float（1.0 那种显示很丑且会被
     # 误当成"这是个计算出来的数"）
     df['src_row'] = df['src_row'].astype('Int64')
@@ -101,6 +102,9 @@ def main():
     for g, sub in df.groupby('group_key', sort=False):
         print('  %-6s %-16s %2d 条   %s'
               % (g, GROUPS[g], len(sub), '/'.join(sub['factor_id'].head(4))))
+    n_abs = int((~df['xs_comparable']).sum())
+    print('🔴 横截面【不可比】的 %d 个（单位是 元/股/元-天）—— '
+          '它们的"排第几"排的是量纲不是信号' % n_abs)
     print('可信度：%s' % '  '.join(
         '%s=%d' % (k, int((df['tier'] == k).sum())) for k in TIERS))
     print('对回 factors.xlsx：命中 %d / 未命中 %d；重名待定 %d'
