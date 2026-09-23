@@ -29,6 +29,7 @@
 
 - 聚宽：各 loader 的模块 docstring（`datalake/build/load_jq_*.py`）
 - 聚宽因子：[../jqfactor-口径.md](../jqfactor-口径.md)（含**已排除的候选清单**）
+- 因子清单能不能复现：[../因子清单-可复现性.md](../因子清单-可复现性.md)（`factors.xlsx` 285 条逐条定案：可复现 234 / 口径未定案 47 / 数据缺 4）
 - 聚宽速查：[../聚宽接口备忘.md](../聚宽接口备忘.md)
 - QMT：`assay/qmt/PROBE_FINDINGS.md`（开头速查表 + 四轮推导）
 - QMT 可执行版：`assay/qmt/probe_all.py` 顶部的 `CONFIRMED`（跑一次打印全部定案结论）
