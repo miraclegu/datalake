@@ -48,7 +48,17 @@ SINCE = '2015-01-01'
 RTOL = 1e-10
 FIDS = ['ma5', 'ma10', 'ma20', 'ma60', 'ma120',
         'ema5', 'ema10', 'ema12', 'ema20', 'ema26', 'ema120',
-        'boll_up', 'boll_dn', 'macd', 'bbi']
+        'boll_up', 'boll_dn', 'macd', 'bbi',
+        'cci10', 'cci15', 'cci20', 'cci88',
+        'bias5', 'bias10', 'bias20', 'bias60',
+        'atr6', 'atr14']
+
+#: 这几个要 high/low/close（后复权）而不只是 close
+NEED_HLC = {'cci10', 'cci15', 'cci20', 'cci88', 'atr6', 'atr14'}
+#: 🔴 BIAS 两边差 **100 倍**：因子取小数、indicators 取百分数（见 osc.py 的
+#:   那张分歧表）。对数时把我的值 ×100 —— 这是**声明的**口径差，
+#:   不是分叉；混着比的话会报一个 99% 的假分叉。
+SCALE = {'bias5': 100.0, 'bias10': 100.0, 'bias20': 100.0, 'bias60': 100.0}
 
 
 def ref(cl, fid):
@@ -79,6 +89,13 @@ def ref(cl, fid):
         return [2 * (dif[i] - dea[i])
                 if (dif[i] is not None and dea[i] is not None) else None
                 for i in range(len(cl))]
+    if fid.startswith('bias'):
+        # 🔴 `_bias_calc` 里有 `round(..., 3)` —— 照抄它的**公式**但不舍入。
+        #   MA 仍然用 ind._ma，口径还是那边的（要证的是口径不是算术）。
+        n = int(fid[4:])
+        ma = ind._ma(cl, n)
+        return [((cl[i] / ma[i] - 1) * 100) if ma[i] else None
+                for i in range(len(cl))]
     if fid == 'bbi':
         ms = [ind._ma(cl, k) for k in (3, 6, 12, 24)]
         return [(sum(m[i] for m in ms) / 4.0)
@@ -87,12 +104,43 @@ def ref(cl, fid):
     raise KeyError(fid)
 
 
+def ref_hlc(bars, tr, fid):
+    """要 H/L/C 的那几个。`bars` 已是后复权。"""
+    if fid.startswith('cci'):
+        # 🔴 `_cci_calc` 里有 `round(..., 2)`，舍入上界 5e-3 —— 拿它的输出比
+        #   会报一个 5.00e-03 的假分叉（这个坑本轮是**第三次**踩：
+        #   `_r3` / `round(·,2)` / `round(·,3)`）。照抄公式、不舍入。
+        n = int(fid[3:])
+        tp = [(b['high'] + b['low'] + b['close']) / 3.0 for b in bars]
+        ma = ind._ma(tp, n)
+        o = []
+        for i in range(len(bars)):
+            if ma[i] is None:
+                o.append(None)
+                continue
+            seg = tp[i - n + 1:i + 1]
+            md = sum(abs(v - ma[i]) for v in seg) / n
+            o.append((tp[i] - ma[i]) / (0.015 * md) if md else None)
+        return o
+    if fid.startswith('atr'):
+        # 🔴 **喂我自己的 TR**，而不是让 indicators 从 bars 重算 ——
+        #   这一条要证的是「Wilder 平滑口径一致」，而 TR 的定义两边本来
+        #   就有一处【已声明】的差别：indicators 拿前一根的 close 当 PC，
+        #   因子按规格文档用 `preclose × hfq_factor`。实测最大差 0.005，
+        #   那正是 CLAUDE.md 记过的「权威 close_hfq vs 推算 close_bfq×factor
+        #   各自舍入」（<0.004 那条），**不是除权问题**（833 处差异里只有
+        #   3 处落在除权日）。所以它单独用 `tr_gap` 那条判据管，
+        #   不混进平滑口径这条里 —— 混着比的话两个问题都说不清。
+        return ind._wilder(tr, int(fid[3:]))
+    raise KeyError(fid)
+
+
 def main():
     import duckdb
     g = os.path.join(DL, 'mart', 'panel_daily', 'panel_*.parquet')
     df = duckdb.connect(':memory:').execute("""
-        SELECT jq_code, date, close_hfq, close_bfq, high, low,
-               hfq_factor, volume_shares
+        SELECT jq_code, date, close_hfq, close_bfq, open, high, low, preclose,
+               hfq_factor, volume_shares, amount, turnover
         FROM read_parquet('%s') WHERE jq_code IN %s AND date >= DATE '%s'
         ORDER BY jq_code, date""" % (g, CODES, SINCE)).df()
     x = Ctx(df)
@@ -108,7 +156,17 @@ def main():
         for c in CODES:
             m = (D['jq_code'] == c).values
             cl = [float(v) for v in D.loc[m, 'close_hfq']]
-            r, mine = ref(cl, fid), V[fid][m]
+            if fid in NEED_HLC:
+                bars = [{'high': float(h), 'low': float(lo), 'close': float(cc)}
+                        for h, lo, cc in zip(D.loc[m, '_high_hfq'],
+                                             D.loc[m, '_low_hfq'],
+                                             D.loc[m, 'close_hfq'])]
+                tr = [float(v) if np.isfinite(v) else None
+                      for v in D.loc[m, '_tr']]
+                r = ref_hlc(bars, tr, fid)
+            else:
+                r = ref(cl, fid)
+            mine = V[fid][m] * SCALE.get(fid, 1.0)
             for a, b in zip(r, mine):
                 if a is None or not np.isfinite(b):
                     continue
@@ -137,13 +195,34 @@ def main():
         mu = sum(seg) / 20
         d2 = max(d2, abs(2 * ((sum((v - mu) ** 2 for v in seg) / 20) ** 0.5)
                          - 2 * ((sum((v - mu) ** 2 for v in seg) / 19) ** 0.5)))
+    # 🔴 TR 的 PC 定义差：必须小于一个最小价位变动（0.01），否则就不是
+    #   舍入而是真分叉了。
+    tg = 0.0
+    for c in CODES:
+        m = (D['jq_code'] == c).values
+        bars = [{'high': float(h), 'low': float(lo), 'close': float(cc)}
+                for h, lo, cc in zip(D.loc[m, '_high_hfq'],
+                                     D.loc[m, '_low_hfq'], D.loc[m, 'close_hfq'])]
+        ti = ind._tr(bars)
+        for a, b in zip(ti, D.loc[m, '_tr']):
+            if a is not None and np.isfinite(b):
+                tg = max(tg, abs(float(a) - float(b)))
+    print('\nTR 的 PC 定义差（前一根 close vs preclose×factor）: max %.4f  -> %s'
+          % (tg, '✓ 小于一个最小价位变动(0.01)，是已知的舍入差'
+             if tg < 0.01 else '🔴 超出舍入量级，要查'))
+    if tg >= 0.01:
+        bad.append('tr_gap')
+
     print('\n反向自证（真分叉必须远大于阈值）：')
     print('  EMA 改"首值起步"      max|差| = %.3e' % d1)
     print('  BOLL σ 改样本(除N−1)  max|差| = %.3e' % d2)
     ok2 = d1 > 1e-3 and d2 > 1e-3
     print('  -> %s' % ('✓ 判据抓得住（比阈值大十个数量级）' if ok2 else '🔴 判据空转'))
 
-    print('\n总判定: %s' % ('✓ 15 项与 indicators.py 口径一致'
+    # ★ 条数**自己算**，不写死 —— 写死的话下次加因子忘了改，
+    #   报告串会说"15 项全过"而其实跑了 25 项（同「数字写死的话下次再拆
+    #   就得手改，而忘了改的表现是报告串在说谎」）。
+    print('\n总判定: %s' % ('✓ %d 项与 indicators.py 口径一致' % len(FIDS)
                           if not bad and ok2 else '🔴 %s' % (bad or '自证失败')))
     return 0 if (not bad and ok2) else 1
 

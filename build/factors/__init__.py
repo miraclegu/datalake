@@ -141,7 +141,8 @@ class Ctx(object):
     #: 构造时就派生出来的列。🔴 **必须是真列不是 Series** ——
     #: 缓存键是 (算子, 列名, 窗口)，而 Series 不可哈希；传 Series 进来会
     #: 直接 TypeError（那还算好的），或者绕过缓存把同一个窗口算好几遍。
-    DERIVED = ('_ret', '_high_hfq', '_low_hfq')
+    DERIVED = ('_ret', '_high_hfq', '_low_hfq', '_open_hfq', '_pre_hfq',
+              '_tp', '_tr')
 
     def __init__(self, df):
         # 🔴 排序是正确性的前提，不是"顺手" —— 滚动窗口按行序走，
@@ -156,9 +157,26 @@ class Ctx(object):
         d['_ret'] = self._g['close_hfq'].pct_change()
         # 高/低价的后复权：面板里 high/low 是**不复权**的，只有 close 有
         #   `close_hfq`。忘了乘因子的话，跨除权日会算出假的区间位置。
+        # 🔴 面板里 open/high/low/preclose 是【不复权】的，只有 close 有
+        #   `close_hfq`。忘了乘因子的话，跨除权日会算出假的波幅与假的位置
+        #   —— 而它不报错（数还在合理范围内）。`因子实现规格.md` 里
+        #   ATR 那几条写的就是 `high/low/preclose × hfq_factor`。
         if 'high' in d.columns and 'hfq_factor' in d.columns:
-            d['_high_hfq'] = d['high'] * d['hfq_factor']
-            d['_low_hfq'] = d['low'] * d['hfq_factor']
+            f = d['hfq_factor']
+            d['_high_hfq'] = d['high'] * f
+            d['_low_hfq'] = d['low'] * f
+            if 'open' in d.columns:
+                d['_open_hfq'] = d['open'] * f
+            if 'preclose' in d.columns:
+                d['_pre_hfq'] = d['preclose'] * f
+            # 典型价 TP 与真实波幅 TR：CCI / MFI / ATR / 资金流都要它们，
+            # 各算一遍就是四份实现。
+            d['_tp'] = (d['_high_hfq'] + d['_low_hfq'] + d['close_hfq']) / 3.0
+            if '_pre_hfq' in d.columns:
+                hl = d['_high_hfq'] - d['_low_hfq']
+                d['_tr'] = np.maximum(hl, np.maximum(
+                    (d['_high_hfq'] - d['_pre_hfq']).abs(),
+                    (d['_low_hfq'] - d['_pre_hfq']).abs()))
 
     # ---- 原始列 ----
     def col(self, name):
@@ -220,6 +238,76 @@ class Ctx(object):
         """
         return s.reset_index(level=0, drop=True).reindex(self.df.index)
 
+    def rsum(self, col, n):
+        return self._memo('rsum', col, n, lambda: self._flat(self._roll(col, n).sum()))
+
+    def shift(self, col, k):
+        """滞后 k 个交易日。🔴 必须**分组** —— 不分组的话每只票开头 k 行会
+        拿上一只票的尾巴当自己的历史，而它不报错。"""
+        return self._memo('shift', col, k,
+                          lambda: self._by(self.df[col]).shift(k))
+
+    def cumsum(self, col):
+        """从上市起累计（PVT / OBV 这类）。分组同上。"""
+        return self._memo('cumsum', col, 0,
+                          lambda: self._by(self.df[col]).cumsum())
+
+    def _win(self, col, n, fn):
+        """按组做滑动窗口，**向量化**求值。
+
+        🔴 `rolling().apply(..., raw=False)` 会给每个窗口建一个 Series ——
+          实测 4 个 CCI 在 166 万行上花了 **209 秒，占全部因子耗时的 92%%**。
+          换成 `sliding_window_view` 之后同样的活是秒级。
+        ★ **按组切片**做，不是对整列做：整列的窗口矩阵是 (m, n)，
+          m=460 万、n=88 时就是 3 GB —— 会把内存吃光（同「16.3M × 200
+          float64 = 26.1 GB > 24 GB」那次）。逐组做的话每块只有几百行。
+        ★ 窗口里有 NaN 一律给 NaN，与 `rolling(min_periods=n)` 同语义 ——
+          不统一的话同一个因子两条路径给出不同的头部，而它不报错。
+        """
+        arr = self.df[col].to_numpy(dtype='float64')
+        code = self.df['jq_code'].to_numpy()
+        out = np.full(len(arr), np.nan)
+        # 组边界：df 已按 jq_code 排过序（Ctx.__init__ 的前提）
+        starts = np.flatnonzero(np.r_[True, code[1:] != code[:-1]])
+        for a, b in zip(starts, np.r_[starts[1:], len(arr)]):
+            seg = arr[a:b]
+            if len(seg) < n:
+                continue
+            w = np.lib.stride_tricks.sliding_window_view(seg, n)
+            v = np.asarray(fn(w), dtype='float64')
+            v[np.isnan(w).any(axis=1)] = np.nan
+            out[a + n - 1:b] = v
+        return pd.Series(out, index=self.df.index)
+
+    def mad(self, col, n):
+        """平均【绝对】偏差：mean(|x − MA(x,n)|)，窗口内对**当期均值**取。
+
+        🔴 不是标准差 —— CCI 的分母就是它，换成标准差数值会整体偏小约 20%，
+          而那是个"看着完全正常"的错（同 assay/indicators.py 那条）。
+        """
+        return self._memo('mad', col, n, lambda: self._win(
+            col, n, lambda w: np.abs(w - w.mean(axis=1, keepdims=True)).mean(axis=1)))
+
+    def wilder(self, col, n):
+        """Wilder 平滑：首值取前 n 个的均值，之后 (prev×(n−1) + x)/n。
+
+        ★ 它等价于 `ewm(alpha=1/n)` + SMA 起步 —— 与 EMA(span=n) 的
+          alpha=2/(n+1) **不是一回事**。ATR / RSI 用的是这个；
+          混用的话数值能差 10% 以上，而两个都像正常数字
+          （抄 assay/indicators.py 的 `_wilder`）。
+        """
+        return self._memo('wilder', col, n,
+                          lambda: self._ema_impl(col, n, alpha=1.0 / n))
+
+    def since_max(self, col, n):
+        """窗口内【最高值出现在几天前】（0 = 就是今天）。Aroon 用它。"""
+        return self._memo('smax', col, n, lambda: self._win(
+            col, n, lambda w: (n - 1 - np.argmax(w, axis=1)).astype('float64')))
+
+    def since_min(self, col, n):
+        return self._memo('smin', col, n, lambda: self._win(
+            col, n, lambda w: (n - 1 - np.argmin(w, axis=1)).astype('float64')))
+
     def ema(self, col, n):
         """EMA，**首值用 SMA 起步**（不是直接拿首值）。
 
@@ -231,7 +319,7 @@ class Ctx(object):
         """
         return self._memo('ema', col, n, lambda: self._ema_impl(col, n))
 
-    def _ema_impl(self, col, n):
+    def _ema_impl(self, col, n, alpha=None):
         # ★ 这一个**允许收 Series**：MACD 的 DEA 是对 DIF 再做一次 EMA，
         #   而 DIF 是中间量、不是面板列。缓存由调用方用列名做键。
         # 🔴 种子要放在**第一个算得出 SMA 的位置**，不能按行序放第 n−1 行 ——
@@ -249,7 +337,9 @@ class Ctx(object):
         x[first] = seed[first]
         x[after] = s[after]
         return self._flat(x.groupby(g, sort=False).apply(
-            lambda t: t.ewm(span=n, adjust=False, ignore_na=False).mean()))
+            lambda t: (t.ewm(alpha=alpha, adjust=False, ignore_na=False).mean()
+                       if alpha else
+                       t.ewm(span=n, adjust=False, ignore_na=False).mean())))
 
     def slope(self, col, n):
         """窗口内对 (序号 t, 值) 做 OLS 的**斜率**。
@@ -258,14 +348,10 @@ class Ctx(object):
           的分母是常数、分子可以用 `Σ t·y − t̄·Σy` 算 —— 不必逐窗口回归。
         """
         def _f():
-            s = self.df[col]
             t = np.arange(n, dtype='float64')
             tbar = t.mean()
             den = ((t - tbar) ** 2).sum()
-            r = self._by(s).rolling(n, min_periods=n)
-            sy = self._flat(r.sum())
-            sty = self._flat(r.apply(lambda w: float(np.dot(t, w)), raw=True))
-            return (sty - tbar * sy) / den
+            return self._win(col, n, lambda w: (w @ t - tbar * w.sum(axis=1)) / den)
         return self._memo('slope', col, n, _f)
 
 
@@ -284,7 +370,7 @@ def register(specs):
 
 
 def _load():
-    from . import ma, pos, dist                      # noqa: F401  注册副作用
+    from . import ma, pos, dist, turn, vol, osc      # noqa: F401  注册副作用
     return FACTORS
 
 
