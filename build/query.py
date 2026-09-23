@@ -129,6 +129,8 @@ PARQUET = [
     ('paused_daily', 'mart/paused_daily/*.parquet', '停牌（稀疏：未出现=未停牌）'),
     ('factor_catalog', 'mart/factor_catalog.parquet',
      '因子目录：编号/中文名/公式/说明/单位/可信度。🔴 tier=own 是【自建定义】不是聚宽那个因子'),
+    ('factor_daily', 'mart/factor_daily/factor_*.parquet',
+     '因子值面板（98 列 float32，按年分区）。列名 = factor_catalog 的 factor_id'),
 ]
 
 
