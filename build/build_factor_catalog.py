@@ -34,6 +34,7 @@
 """
 import argparse
 import io
+import json
 import os
 import sys
 
@@ -43,9 +44,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DL = os.path.dirname(HERE)                    # datalake 根
 REPO = os.path.dirname(DL)                    # 工作区根（factors.xlsx 在这儿）
 OUT = os.path.join(DL, 'mart', 'factor_catalog.parquet')
+OUT_MISS = os.path.join(DL, 'mart', 'factor_missing.parquet')
+#: 原因表单独一份 —— 它要带上【一条因子都没有】的那些档，而那种档
+#: 在 factor_missing.parquet 里连一行都没有（页面的下拉就会少一项）。
+OUT_REASON = os.path.join(DL, 'mart', 'factor_reasons.json')
 
 sys.path.insert(0, HERE)
-from factors import all_specs, GROUPS, TIERS   # noqa: E402
+from factors import (all_specs, all_missing, all_reasons,  # noqa: E402
+                     covered_by, GROUPS, TIERS, MISS_REASONS)
 
 
 def _src_rows():
@@ -56,21 +62,24 @@ def _src_rows():
     """
     p = os.path.join(REPO, 'factors.xlsx')
     if not os.path.isfile(p):
-        return {}, '没找到 %s' % p
+        return ({}, []), '没找到 %s' % p
     try:
         df = pd.read_excel(p)
     except Exception as e:                                  # noqa: BLE001
-        return {}, '读不了 factors.xlsx: %s' % e
+        return ({}, []), '读不了 factors.xlsx: %s' % e
     col = df.columns[0]
-    m = {}
+    m, order = {}, []
     for i, v in enumerate(df[col].astype(str), start=2):    # 表头占第 1 行
-        m.setdefault(v.strip(), i)
-    return m, None
+        v = v.strip()
+        if v not in m:
+            m[v] = i
+            order.append(v)
+    return (m, order), None
 
 
 def build():
     specs = all_specs()
-    src, err = _src_rows()
+    (src, order), err = _src_rows()
     rows = []
     for s in specs:
         r = s.row()
@@ -84,7 +93,18 @@ def build():
     # src_row 可能有缺 -> 可空整数，不要变成 float（1.0 那种显示很丑且会被
     # 误当成"这是个计算出来的数"）
     df['src_row'] = df['src_row'].astype('Int64')
-    return df, err
+
+    # ---- 算不出来的那半 ----------------------------------------
+    mrows = []
+    for r in all_missing():
+        r = dict(r)
+        r['src_row'] = src.get(r['name_cn'])
+        mrows.append(r)
+    mdf = pd.DataFrame(mrows, columns=[
+        'name_cn', 'reason_key', 'reason_cn', 'reason_why', 'detail',
+        'blocked', 'src_row'])
+    mdf['src_row'] = mdf['src_row'].astype('Int64')
+    return df, mdf, order, err
 
 
 def main():
@@ -92,9 +112,9 @@ def main():
     ap.add_argument('--print', dest='pr', action='store_true', help='只打印不写盘')
     a = ap.parse_args()
 
-    df, err = build()
+    df, mdf, order, err = build()
     if err:
-        print('⚠ %s —— src_row 留空' % err)
+        print('⚠ %s —— src_row 留空，覆盖自证跳过' % err)
 
     n_miss = int(df['src_row'].isna().sum())
     n_dup = int(df['src_dup'].sum())
@@ -110,18 +130,46 @@ def main():
     print('对回 factors.xlsx：命中 %d / 未命中 %d；重名待定 %d'
           % (len(df) - n_miss, n_miss, n_dup))
 
+    print('算不出来的 %d 个，按原因：' % len(mdf))
+    for k, (label, _why, blocked) in MISS_REASONS.items():
+        sub = mdf[mdf['reason_key'] == k]
+        if not len(sub):
+            continue
+        print('  %-13s %s %-22s %2d 条   %s'
+              % (k, '做不了' if blocked else '还没做', label, len(sub),
+                 '、'.join(sub['name_cn'].head(3))))
+
+    # 🔴🔴 覆盖自证：两半必须正好分完原清单，不过就【拒绝写出】。
+    #   手工维护的清单迟早与代码分叉，而两种烂法都不报错：实现了却忘了从
+    #   MISSING 删 -> 广场上同时列在两边；原清单加了一行 -> 它静默地哪一半
+    #   都不在（同 load_tdx_gbbq 拿除权公式复算因子跳变、不过就退出码 2）。
+    if order:
+        ok, msg = covered_by(order)
+        print(('✅ ' if ok else '🔴 ') + msg)
+        if not ok:
+            print('拒绝写出 —— 先把清单补齐再跑一次。')
+            return 2
+
     if a.pr:
         with pd.option_context('display.max_colwidth', 46, 'display.width', 200):
             print(df[['factor_id', 'name_cn', 'group_key', 'tier',
                       'unit', 'src_row']].to_string(index=False))
+            print()
+            print(mdf[['name_cn', 'reason_key', 'src_row']].to_string(index=False))
         return 0
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    tmp = OUT + '.tmp'
-    df.to_parquet(tmp, index=False)
-    os.replace(tmp, OUT)                     # 原子替换，同项目里其它落盘
-    print('-> %s  (%.1f KB)' % (os.path.relpath(OUT, REPO),
-                                os.path.getsize(OUT) / 1024.0))
+    with io.open(OUT_REASON + '.tmp', 'w', encoding='utf-8') as fh:
+        json.dump(all_reasons(), fh, ensure_ascii=False, indent=1)
+    os.replace(OUT_REASON + '.tmp', OUT_REASON)
+    print('-> %s  (%d 档原因)' % (os.path.relpath(OUT_REASON, REPO),
+                                len(all_reasons())))
+    for path, d in ((OUT, df), (OUT_MISS, mdf)):
+        tmp = path + '.tmp'
+        d.to_parquet(tmp, index=False)
+        os.replace(tmp, path)                # 原子替换，同项目里其它落盘
+        print('-> %s  (%.1f KB)' % (os.path.relpath(path, REPO),
+                                    os.path.getsize(path) / 1024.0))
     return 0
 
 
