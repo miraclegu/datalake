@@ -123,7 +123,7 @@ def main():
         print('  %-6s %-16s %2d 条   %s'
               % (g, GROUPS[g], len(sub), '/'.join(sub['factor_id'].head(4))))
     n_abs = int((~df['xs_comparable']).sum())
-    print('🔴 横截面【不可比】的 %d 个（单位是 元/股/元-天）—— '
+    print('🔴 横截面【不可比】的 %d 个（单位 元(价格)/股/元每天 —— 标度由个股自己决定）—— '
           '它们的"排第几"排的是量纲不是信号' % n_abs)
     print('可信度：%s' % '  '.join(
         '%s=%d' % (k, int((df['tier'] == k).sum())) for k in TIERS))

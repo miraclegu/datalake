@@ -121,12 +121,12 @@ register(
              '🔴 取 Wilder 递推（α=1/6）不是简单均值 —— 与 '
              'assay/indicators.py 同口径；两者能差 10%% 以上，'
              '而都像正常数字',
-             '元', ('high', 'low', 'preclose', 'hfq_factor'), 6 * 4,
+             '元(价格)', ('high', 'low', 'preclose', 'hfq_factor'), 6 * 4,
              lambda x: x.wilder('_tr', 6)),
         Spec('atr14', '14日均幅指标', 'osc',
              'TR = max(H−L, |H−PC|, |L−PC|)；ATR = Wilder(TR, 14)',
              '同 atr6，窗口 14 天（Wilder 的原始参数）',
-             '元', ('high', 'low', 'preclose', 'hfq_factor'), 14 * 4,
+             '元(价格)', ('high', 'low', 'preclose', 'hfq_factor'), 14 * 4,
              lambda x: x.wilder('_tr', 14)),
 
         Spec('aroon_up', 'Aroon指标上轨', 'osc',
@@ -172,11 +172,11 @@ register(
         Spec('bull_power', '多头力道', 'osc', 'H − EMA(C, 13)',
              '当日最高价超出 13 日 EMA 多少 —— 多头把价格推高的能力。'
              '🔴 量纲是【元】，跨股票不可直接比大小',
-             '元', ('high', 'close_hfq', 'hfq_factor'), 13 * 4,
+             '元(价格)', ('high', 'close_hfq', 'hfq_factor'), 13 * 4,
              lambda x: x.col('_high_hfq') - x.ema('close_hfq', 13)),
         Spec('bear_power', '空头力道', 'osc', 'L − EMA(C, 13)',
              '当日最低价低于 13 日 EMA 多少（通常为负）',
-             '元', ('low', 'close_hfq', 'hfq_factor'), 13 * 4,
+             '元(价格)', ('low', 'close_hfq', 'hfq_factor'), 13 * 4,
              lambda x: x.col('_low_hfq') - x.ema('close_hfq', 13)),
 
         Spec('wvad', '威廉变异离散量', 'osc',

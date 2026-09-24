@@ -32,7 +32,7 @@ register(
           'MA(C, %d)' % n,
           '最近 %d 天后复权收盘价的算术平均。趋势线：几条均线的相对位置'
           '（多头/空头排列）说明趋势的方向与强弱' % n,
-          '元', ('close_hfq',), n,
+          '元(价格)', ('close_hfq',), n,
           (lambda n: lambda x: x.ma('close_hfq', n))(n))
      for n, cn in _MA_N] +
 
@@ -40,7 +40,7 @@ register(
           'EMA(C, %d)　首值用 SMA(%d) 起步' % (n, n),
           '指数加权均线，比同周期 MA 更贴近最新价。🔴 首值用 SMA 起步'
           '（与 assay/indicators.py 同口径），不是拿第一个收盘价当种子',
-          '元', ('close_hfq',), n * 4,
+          '元(价格)', ('close_hfq',), n * 4,
           (lambda n: lambda x: x.ema('close_hfq', n))(n))
      for n, cn in _EMA_N] +
 
@@ -49,7 +49,7 @@ register(
              'DIF = EMA(C,12) − EMA(C,26)；DEA = EMA(DIF,9)；MACD = 2×(DIF − DEA)',
              '看趋势的转折与力度。这里取的是【柱】（DIF−DEA 的两倍），'
              '正负与大小合起来说明动能的方向与强弱',
-             '元', ('close_hfq',), 26 * 3 + 9,
+             '元(价格)', ('close_hfq',), 26 * 3 + 9,
              lambda x: _macd(x, 'close_hfq')),
 
         Spec('vmacd', '成交量指数平滑异同移动平均线', 'ma',
@@ -79,19 +79,19 @@ register(
              '布林通道上轨。🔴 σ 取【总体】标准差（除 N，不是 N−1）—— '
              '与 assay/indicators.py 同口径；用样本标准差算出来的通道'
              '会系统性偏宽，而它不报错',
-             '元', ('close_hfq',), 20,
+             '元(价格)', ('close_hfq',), 20,
              lambda x: x.ma('close_hfq', 20) + 2 * x.std_pop('close_hfq', 20)),
 
         Spec('boll_dn', '下轨线（布林线）指标', 'ma',
              'MA(C,20) − 2 × STD_总体(C,20)',
              '布林通道下轨，口径同上轨',
-             '元', ('close_hfq',), 20,
+             '元(价格)', ('close_hfq',), 20,
              lambda x: x.ma('close_hfq', 20) - 2 * x.std_pop('close_hfq', 20)),
 
         Spec('bbi', 'BBI 动量', 'ma',
              '(MA(C,3) + MA(C,6) + MA(C,12) + MA(C,24)) / 4',
              '四条不同周期均线的平均，相当于一条"多周期共识"的中枢线',
-             '元', ('close_hfq',), 24,
+             '元(价格)', ('close_hfq',), 24,
              lambda x: (x.ma('close_hfq', 3) + x.ma('close_hfq', 6)
                         + x.ma('close_hfq', 12) + x.ma('close_hfq', 24)) / 4.0),
     ]

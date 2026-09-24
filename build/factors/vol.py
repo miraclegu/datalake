@@ -127,15 +127,15 @@ register(
 
         Spec('a_ma6', '6日成交金额的移动平均值', 'vol', 'MA(A, 6)',
              '6 日均成交额。比均量更适合跨股票比（额已经含了价）',
-             '元', ('amount',), 6, lambda x: x.ma('amount', 6)),
+             '元(金额)', ('amount',), 6, lambda x: x.ma('amount', 6)),
         Spec('a_ma20', '20日成交金额的移动平均值', 'vol', 'MA(A, 20)',
              '20 日均成交额，选股里最常用的流动性门槛就是它',
-             '元', ('amount',), 20, lambda x: x.ma('amount', 20)),
+             '元(金额)', ('amount',), 20, lambda x: x.ma('amount', 20)),
         Spec('a_std6', '6日成交金额的标准差', 'vol', 'STD_样本(A, 6)',
-             '成交额的短期波动', '元', ('amount',), 6,
+             '成交额的短期波动', '元(金额)', ('amount',), 6,
              lambda x: x.std_samp('amount', 6)),
         Spec('a_std20', '20日成交金额的标准差', 'vol', 'STD_样本(A, 20)',
-             '成交额的波动，窗口 20 天', '元', ('amount',), 20,
+             '成交额的波动，窗口 20 天', '元(金额)', ('amount',), 20,
              lambda x: x.std_samp('amount', 20)),
 
         Spec('mfi14', '资金流量指标', 'vol',
@@ -147,7 +147,7 @@ register(
 
         Spec('mf_sum20', '20日资金流量', 'vol', 'Σ₂₀ (TP × V)',
              '20 天的资金流总量（不分方向）。它与成交额的差别是用 TP 不是均价',
-             '元', ('high', 'low', 'close_hfq', 'hfq_factor', 'volume_shares'), 20,
+             '元(金额)', ('high', 'low', 'close_hfq', 'hfq_factor', 'volume_shares'), 20,
              lambda x: x.rsum(_tpv(x), 20)),
 
         Spec('pvt', '单日价量趋势', 'vol',

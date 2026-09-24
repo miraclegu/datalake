@@ -42,7 +42,7 @@ TTM = [
      '⚠ 非空率 77.8%，同上'),
 ]
 
-register([Spec(fid, cn, 'ttm', e, d, '元', deps_of(e), 1, expr(e))
+register([Spec(fid, cn, 'ttm', e, d, '元(金额)', deps_of(e), 1, expr(e))
           for fid, cn, e, d in TTM])
 
 EV = '(totalmv + %s - z(b_cash_equivalents))' % (
@@ -59,10 +59,11 @@ register([
 ])
 
 VAL = [
-    ('mv', '市值', 'totalmv', '总市值。🔴 单位元，横截面排的是公司大小', '元'),
+    ('mv', '市值', 'totalmv', '总市值。★ 横截面【可比】—— 元是全市场共同标度，'
+     '而本仓库 froec 的第三层就是按流通市值升序取 10', '元(金额)'),
     ('mv_float', '流通市值', 'floatmv',
      '⚠ 两个口径：`share_rmb`=流通 A 股 vs `share_trade_total`=含 B/H。'
-     '面板取的是前者。🔴 单位元', '元'),
+     '面板取的是前者。⚠ 绝对额', '元(金额)'),
     ('ln_mv', '对数总市值', 'log(totalmv)',
      '取对数之后分布接近正态，是 Barra SIZE 的定义。★ 取对数【不改变序】，'
      '所以它与市值的横截面 IC 完全相同 —— 差别在做回归时', '对数元'),
