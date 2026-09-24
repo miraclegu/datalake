@@ -108,10 +108,18 @@ run(){   # run <名字> <工作目录> <命令...>
 # 所以研究链走 run_soft：失败**照样醒目地报出来**（进 STEPS_WARN，
 # 末尾汇总里单列一行），但不影响 STEPS_BAD、不影响出信号、不影响退出码。
 #
-# ⚠ 9/11 ETF lake 目前仍用 `run` —— 也就是说**它失败会掐掉实盘信号**。
+# ⚠ 9/12 ETF lake 目前仍用 `run` —— 也就是说**它失败会掐掉实盘信号**。
 #   那是既有行为，这一轮**没有动它**（改它是另一个决定：ETF lake 只喂
 #   ETF 策略的回测与模拟盘，掐掉股票策略的信号确实过宽）。记在这里，
 #   别下次当成"漏了"。
+#
+# ⚠ 10/12 公司行动 gbbq 走 `run_soft`，而它**确实喂实盘**（按它调成本与股数）
+#   —— 所以这条的分工要说清，别记反：
+#     出信号   不读 gbbq（信号只回答"明天买卖什么"），掐掉它没有道理
+#     调成本   读 gbbq。它失败 -> parquet 停在昨天 -> **今天除权的那几只
+#              不会被调** —— 那正是"漏了不报错"的形状
+#   所以**失败只告警是不够的**，消费侧（`assay/lv/corp.py`）必须自己查
+#   这份 parquet 的新鲜度并把落后说给页面听（同「拒单必须可见」）。
 STEPS_WARN=()
 run_soft(){   # 同 run，但失败只告警：不进 STEPS_BAD、不影响出信号与退出码
   local name="$1" wd="$2"; shift 2
@@ -141,11 +149,11 @@ say "======================================================================"
 #   而且 datalake 只用 tdx.db 的 raw_kline_daily / raw_adjust_factor /
 #   raw_basic_daily / raw_symbol_class 四张表（load_tdx_kline.py 里查得到），
 #   技术指标那步与本链无关。所以直接调 tdx2db cron。
-run "1/11 tdx2db cron（抓日线+复权因子）" "$TDX" ./tdx2db cron --dburi "duckdb://./tdx.db"
+run "1/12 tdx2db cron（抓日线+复权因子）" "$TDX" ./tdx2db cron --dburi "duckdb://./tdx.db"
 
 # ★ 这一步【漏一天永久丢失】，所以即使前面失败也要跑：它读的是 tdx.db
 #   的当前状态，与 cron 是否成功无关。
-run "2/11 PIT 快照（漏一天不可逆）" "$TDX" python3 daily_snapshot.py
+run "2/12 PIT 快照（漏一天不可逆）" "$TDX" python3 daily_snapshot.py
 
 # 🔴🔴 ETF 价格按【.day 正本】重写 —— **必须每天跑，且必须在 load_tdx_kline 之前**。
 #
@@ -179,7 +187,7 @@ run "2/11 PIT 快照（漏一天不可逆）" "$TDX" python3 daily_snapshot.py
 #    才在 09-01 再次发生时报"异常 0"。
 #
 # 幂等：写的是正本值，重复跑收敛（第二次报"无事可做"）。
-run "3/11 ETF 价格按 .day 正本重写" "$TDX" \
+run "3/12 ETF 价格按 .day 正本重写" "$TDX" \
     python3 scripts/fix_etf_price_from_dayfile.py --db ./tdx.db
 
 # 🔴 更新体检 —— 上一步的**守卫**，也是整条 A 腿的守卫。
@@ -188,14 +196,14 @@ run "3/11 ETF 价格按 .day 正本重写" "$TDX" \
 #   ★ 它本来就是为 2026-05-25 那次写的，但同样没接进链；而且 `--since`
 #     那条路径有个 `DATE ?` 的语法错误，一跑就抛 ParserException ——
 #     也就是说这个守卫从上线起就没体检过任何一天。已一并修好。
-run "4/11 更新体检（大批跳变即中止）" "$TDX" \
+run "4/12 更新体检（大批跳变即中止）" "$TDX" \
     python3 scripts/check_data_anomaly.py --db ./tdx.db --since "$(date -v-10d +%F 2>/dev/null || date -d '10 days ago' +%F)"
 
 if [ ${#STEPS_BAD[@]} -eq 0 ]; then
-  run "5/11 tdx -> raw/std" "$ROOT" python3 datalake/build/load_tdx_kline.py \
-    && run "6/11 交易日历（含未来，带对数）" "$ROOT" python3 datalake/build/build_trade_calendar.py \
-    && run "7/11 面板（本年增量）" "$ROOT" python3 datalake/build/build_panel_daily.py --year "$(date +%Y)" \
-    && run "8/11 beta" "$ROOT" python3 datalake/build/build_beta_daily.py
+  run "5/12 tdx -> raw/std" "$ROOT" python3 datalake/build/load_tdx_kline.py \
+    && run "6/12 交易日历（含未来，带对数）" "$ROOT" python3 datalake/build/build_trade_calendar.py \
+    && run "7/12 面板（本年增量）" "$ROOT" python3 datalake/build/build_panel_daily.py --year "$(date +%Y)" \
+    && run "8/12 beta" "$ROOT" python3 datalake/build/build_beta_daily.py
   # 🔴🔴 **ETF lake 也要每天建 —— 它一直是手工跑的，于是它停在哪天没人知道。**
   #   2026-09-18 实测：主数据到 09-17，而 `etf_lake` 停在 **09-11**
   #   （上次手工跑是 09-13）。ETF 模拟盘「推进到最新数据日」于是只能到 09-11，
@@ -205,8 +213,24 @@ if [ ${#STEPS_BAD[@]} -eq 0 ]; then
   #   ★ 幂等、**1.6 秒**（实测三次数值指纹相同）—— 便宜到没有不每天跑的理由。
   #   ★ 放在链尾：它失败**不影响主面板**（5~8 已经跑完），而主面板才是
   #     `is_stale` 的判据，所以不会因为它失败就每 10 分钟重跑整条链。
-  run "9/11 ETF lake（ETF 策略跑在它上面）" "$ROOT" \
+  run "9/12 ETF lake（ETF 策略跑在它上面）" "$ROOT" \
     python3 datalake/build/build_etf_lake.py
+
+  # 🔴🔴 **公司行动（除权除息 / 送转 / 配股）导出 —— 实盘要按它调成本与股数。**
+  #   2026-09-23：红利账户实测少算 3,560 元 —— 分红到账进了现金，而持仓成本
+  #   **没有跟着除权往下调**，于是浮盈被系统性报低、且**不报错**。
+  #   而聚宽的 `std/dividend.parquet` 要**手动导**（B 腿是事件驱动的），
+  #   缺一条就静默少一次除权 —— 所以口径正本取 **tdx 的 gbbq**（随 cron 每天到，
+  #   且比聚宽早：实测 gbbq 提前 4 天覆盖除权）。
+  #   ★ 排在 1/12（tdx2db cron）之后 —— 它读的就是那一步写进 tdx.db 的
+  #     `raw_gbbq`；挪到前面读的是**昨天**的，而那不报错
+  #     （同 ETF lake 排在 load_tdx_kline 之后那条）。
+  #   ★ assay 侧一律读 parquet，不直接连 tdx.db（cron 会持有写锁）。
+  #   ★ 自证在脚本里：拿**通用除权公式**复算 hfq_factor 的跳变，
+  #     35,621 个样本平均误差必须 < 1e-6，否则**拒绝写出**（退出码 2）。
+  #     反向验过：漏掉送转那一项 -> 平均误差 0.0716 -> 当场拒绝。
+  run_soft "10/12 公司行动 gbbq（实盘按它调成本）" "$ROOT" \
+    python3 datalake/build/load_tdx_gbbq.py
 
   # 🔴 **必须排在 7/11（面板）之后** —— 它吃 `mart/panel_daily`。
   #   挪到前面读的是**昨天**的面板，而那不报错，只是整份因子值晚一天
@@ -215,9 +239,9 @@ if [ ${#STEPS_BAD[@]} -eq 0 ]; then
   #   所以一天里轮询跑多次也只真算一次。
   # ★ 目录表排在面板之前：它只读注册表、0.1 秒，先落下来的话即使面板
   #   那步挂了，"有哪些因子、怎么算的"仍然是最新的。
-  run_soft "10/11 因子目录表" "$ROOT" \
+  run_soft "11/12 因子目录表" "$ROOT" \
     python3 datalake/build/build_factor_catalog.py
-  run_soft "11/11 因子值面板（162 个因子）" "$ROOT" \
+  run_soft "12/12 因子值面板（162 个因子）" "$ROOT" \
     python3 datalake/build/build_factor_daily.py
 else
   say ""
