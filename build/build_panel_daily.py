@@ -92,7 +92,14 @@ OUT  = os.path.join(ROOT, 'mart', 'panel_daily')
 OUT_PAUSED = os.path.join(ROOT, 'mart', 'paused_daily')
 START_YEAR, END_YEAR = 2003, 2026
 
+# 🔴 **加一个指数 = 全量重建面板**（24 年，实测约 6 分钟）—— 因为
+#   `read_parquet(glob)` 对 schema 不一致的分区直接报错，中途只建一半的话
+#   整条链（看板 / 回测 / 实盘信号）都打不开。响亮，但要一次跑完。
+# ★ `399303.XSHE` 是**国证2000**（2026-09-24 加，因子广场分池评价要它）。
+#   ⚠ 中证全指 `000985` 本地 `index_member_asof` 里**一行都没有**，给不了。
+#   ⚠ 中证2000 是 `932000.CSI`（成分有 2001 只），与国证2000 是两个指数。
 INDEXES = {'000300.XSHG': 'in_hs300', '000905.XSHG': 'in_zz500',
+           '399303.XSHE': 'in_gz2000',
            '000852.XSHG': 'in_zz1000', '000016.XSHG': 'in_sz50',
            '399006.XSHE': 'in_cyb', '000688.XSHG': 'in_kc50',
            '000906.XSHG': 'in_zz800'}
@@ -535,20 +542,25 @@ def prepare(con):
       FROM security_status
     ) WHERE _rn = 1
     """)
-    # 指数成分：月度快照 → 每个 (code, as_of) 一行宽表
-    cols = ',\n'.join(
-        "max(CASE WHEN index_code='%s' THEN 1 ELSE 0 END) AS %s" % (k, v)
-        for k, v in INDEXES.items())
-    con.execute("""
-    CREATE OR REPLACE TEMP VIEW _idx AS
-    SELECT stock_code AS code, as_of, %s
-    FROM index_member_asof GROUP BY 1, 2
-    """ % cols)
+    # 指数成分：**每个指数各自一套快照序列**（见下面那段 🔴）
+    for k, v in INDEXES.items():
+        con.execute("CREATE OR REPLACE TEMP VIEW _sn_%s AS "
+                    "SELECT DISTINCT as_of FROM index_member_asof "
+                    "WHERE index_code='%s'" % (v, k))
+        con.execute("CREATE OR REPLACE TEMP VIEW _mb_%s AS "
+                    "SELECT DISTINCT stock_code AS code, as_of "
+                    "FROM index_member_asof WHERE index_code='%s'" % (v, k))
 
 
 def build_year(con, y):
     idx_sel = ',\n           '.join(
-        'COALESCE(x.%s, 0)::TINYINT AS %s' % (v, v) for v in INDEXES.values())
+        '(mb_%s.code IS NOT NULL)::TINYINT AS %s' % (v, v)
+        for v in INDEXES.values())
+    idx_join = '\n    '.join(
+        'ASOF LEFT JOIN _sn_{v} sn_{v} ON sn_{v}.as_of <= c.date\n'
+        '    LEFT JOIN _mb_{v} mb_{v} '
+        'ON mb_{v}.code=c.jq_code AND mb_{v}.as_of=sn_{v}.as_of'.format(v=v)
+        for v in INDEXES.values())
     sql = """
     WITH base AS (
         -- 只取能对上聚宽 PIT 维度的 A 股；跨年多取一天用于算 ret_1d
@@ -678,7 +690,7 @@ def build_year(con, y):
          AND c.high <= round(b.preclose*(1+({lim})),2) + 0.005) AS is_open_limit_up,
         (b.preclose > 0 AND abs(c.open - round(b.preclose*(1-({lim})),2)) < 0.005
          AND c.low  >= round(b.preclose*(1-({lim})),2) - 0.005) AS is_open_limit_down,
-        -- 指数成分（as-of）
+        -- 指数成分（as-of，每个指数各自一套快照）
         {idx}
     FROM cur c
     LEFT JOIN basic_daily b ON b.symbol=c.symbol AND b.date=c.date
@@ -689,10 +701,20 @@ def build_year(con, y):
     -- 聚宽权威单季指标（eps/roe/扣非），按公告日 as-of，与 _fin3 同样是 PIT
     ASOF LEFT JOIN _ind    ai ON ai.code=c.jq_code AND ai.pub_date <= c.date
     ASOF LEFT JOIN _status s ON s.code=c.jq_code AND s.eff_from  <= c.date
-    -- 先全局定位当日适用的快照日，再精确 join（见文件头「成分」说明）
-    ASOF LEFT JOIN (SELECT DISTINCT as_of FROM index_member_asof) sn
-         ON sn.as_of <= c.date
-    LEFT JOIN _idx x ON x.code=c.jq_code AND x.as_of=sn.as_of
+    -- 🔴🔴 **每个指数各自 ASOF 到它自己的快照序列**（2026-09-24 修）。
+    --   原来是「ASOF 出当日适用的**全局**快照日，再精确 join」，而
+    --   `index_member_asof` 里**各指数的快照频率不一样**：
+    --     399101 中小综指 / 399102 创业板综   **周频**（1061 / 823 个）
+    --     沪深300 / 中证500 / 国证2000 …      **月频**（约 261 个）
+    --   于是大多数日子全局 ASOF 落到一个**只含那两个周频指数**的快照日上，
+    --   沪深300 那边 `x.as_of = sn.as_of` 一行都 join 不上 -> in_hs300 = 0。
+    --   **实测 2016 起 2607 个交易日里只有 449 天（17%）有成分，
+    --   其余 83% 全是 0，而它不报错** —— 个股页的指数标签、盘面页的
+    --   「指数成分等权涨幅」因此在多数日子是空的。
+    -- ★ 这**不是**文件头警告的那种「按 code 各自 ASOF」（那会让退出成分的
+    --   票只进不出）。这里 ASOF 的仍然是**快照日**，只是每个指数用自己那串
+    --   —— 退出成分的票在新快照里没有行，`mb.code IS NULL` -> 0，出得来。
+    {idx_join}
     -- ★ 名称取自 security_name（专用名称历史表），不能用 security_status.name。
     --   security_status 只在【状态】变化时才有新行，公司改名而状态不变时
     --   它的 name 字段就停在旧值 —— 实测 2024-06-28 有 888/5088 行（17.4%）
@@ -707,7 +729,7 @@ def build_year(con, y):
          AND i.valid_from <= c.date AND (i.valid_to IS NULL OR i.valid_to > c.date)
     LEFT JOIN security_universe u ON u.code=c.jq_code
     ORDER BY c.jq_code, c.date
-    """.format(y=y, y1=y + 1, st=','.join(ST_STATUS), risk=','.join(RISK_STATUS), idx=idx_sel,
+    """.format(y=y, y1=y + 1, st=','.join(ST_STATUS), risk=','.join(RISK_STATUS), idx=idx_sel, idx_join=idx_join,
                lim=LIMIT_PCT_TMPL.format(st=','.join(ST_STATUS),
                                          st10=ST_MAIN_10PCT_FROM))
     out = os.path.join(OUT, 'panel_%d.parquet' % y)
