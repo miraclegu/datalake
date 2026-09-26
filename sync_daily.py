@@ -93,6 +93,14 @@ while _d != os.path.dirname(_d) and not os.path.isfile(
         os.path.join(_d, 'paths.py')):
     _d = os.path.dirname(_d)
 sys.path.insert(0, _d)
+# ---- 输出编码（Windows 上不做这件事整条链会崩，见 datalake/console.py）----
+_d = os.path.dirname(os.path.abspath(__file__))
+while _d != os.path.dirname(_d) and not os.path.isfile(
+        os.path.join(_d, 'console.py')):
+    _d = os.path.dirname(_d)
+sys.path.insert(0, _d)
+import console as _console                                  # noqa: E402
+_console.setup()
 from paths import TDX_DIR as TDX, tdx2db_bin, launchd_logs                    # noqa: E402
 import logs as _logs                                                          # noqa: E402
 LOGDIR = os.path.join(DL, '_manifest', 'sync_logs')
