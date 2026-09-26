@@ -10,7 +10,7 @@
 <dict>
   <key>Label</key><string>com.miraclegu.finacial.tick</string>
   <key>ProgramArguments</key>
-  <array><string>/opt/homebrew/opt/python@3.13/bin/python3.13</string><string>/Users/guhao/finacial/assay/tick_daily.py</string></array>
+  <array><string>/Users/guhao/.venvs/finacial/bin/python</string><string>/Users/guhao/finacial/assay/tick_daily.py</string></array>
   <key>WorkingDirectory</key><string>/Users/guhao/finacial/datalake</string>
   <key>StartCalendarInterval</key>
   <array>
@@ -41,6 +41,6 @@
   <!-- 🔴 PATH 里必须有装了 duckdb 的那个 python3；launchd 默认环境很窄，
        缺了它 2/6 PIT 快照会 ModuleNotFoundError，而那一步漏一天不可逆 -->
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>/opt/homebrew/opt/python@3.13/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <dict><key>PATH</key><string>/Users/guhao/.venvs/finacial/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
 </dict>
 </plist>
