@@ -29,12 +29,23 @@ import sys
 
 DL = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(DL)
-TDX = os.path.join(DL, 'raw', 'tdx', '_ingest')
+# ---- datalake 侧路径的正本：`datalake/paths.py` ----
+# 🔴 **往上找它，不数 dirname 层数** —— 层数跟着"这个文件放在哪"变，
+#   搬一次就要改一次，而改漏了不报错（同 assay/paths.py 那条）。找不到就一路
+#   走到文件系统根，导入正本时抛 ImportError —— **响亮失败**，不会静默
+#   退回某个猜出来的路径。
+_d = os.path.dirname(os.path.abspath(__file__))
+while _d != os.path.dirname(_d) and not os.path.isfile(
+        os.path.join(_d, 'paths.py')):
+    _d = os.path.dirname(_d)
+sys.path.insert(0, _d)
+from paths import TDX_DIR as TDX, tdx_dir, tdx2db_bin             # noqa: E402
 
 
 def _bin(tdx=TDX):
-    return os.path.join(tdx, 'tdx2db.exe' if platform.system() == 'Windows'
-                        else 'tdx2db')
+    # 🔴 可执行文件名（Windows 上是 .exe）只在 `paths.tdx2db_bin` 一处定义 ——
+    #   此前 4 处各写一遍，而 setup_tdx 那份用的还是 `os.name == 'nt'`。
+    return os.path.join(tdx, os.path.basename(tdx2db_bin()))
 
 
 def _q(sql):
@@ -71,7 +82,12 @@ def stages(DL=DL, ROOT=ROOT):
         manual  要人工（聚宽那条腿）
     """
     py = sys.executable
-    TDX = os.path.join(DL, 'raw', 'tdx', '_ingest')
+    # 🔴🔴 **这一行不是"重复的局部"，是这个函数的参数化。**
+    #   `stages(DL=临时空目录)` 就是靠它把整条链指过去的（用例在空目录上
+    #   验"什么都还没建"）。我上一轮当成分叉删掉 -> 空 lake 上 tdx2db 与
+    #   bootstrap 两个阶段去查**真实目录**、报成 `ok`，**而它不报错**。
+    #   是守卫当场抓到的。段只在 `paths.tdx_dir` 一处拼。
+    TDX = tdx_dir(DL)
     out = []
 
     # ① tdx2db（上游 github.com/jing2uo/tdx2db，有 Windows_x86_64 预编译包）

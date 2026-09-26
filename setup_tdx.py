@@ -201,6 +201,7 @@ import io
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -211,9 +212,21 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))            # datalake/
 REPO = os.path.dirname(ROOT)                                 # finacial/
-TDX = os.path.join(ROOT, 'raw', 'tdx', '_ingest')            # tdx2db 与 tdx.db 的家
-BIN = os.path.join(TDX, 'tdx2db' + ('.exe' if os.name == 'nt' else ''))
-DB = os.path.join(TDX, 'tdx.db')
+# ---- datalake 侧路径的正本：`datalake/paths.py` ----
+# 🔴 **往上找它，不数 dirname 层数** —— 层数跟着"这个文件放在哪"变，
+#   搬一次就要改一次，而改漏了不报错（同 assay/paths.py 那条）。找不到就一路
+#   走到文件系统根，导入正本时抛 ImportError —— **响亮失败**，不会静默
+#   退回某个猜出来的路径。
+_d = os.path.dirname(os.path.abspath(__file__))
+while _d != os.path.dirname(_d) and not os.path.isfile(
+        os.path.join(_d, 'paths.py')):
+    _d = os.path.dirname(_d)
+sys.path.insert(0, _d)
+import paths as _paths                                  # noqa: E402
+
+TDX = _paths.TDX_DIR                         # tdx2db 与 tdx.db 的家
+BIN = _paths.tdx2db_bin()                    # Windows 上是 .exe，见 paths.py
+DB = _paths.TDX_DB
 VIPDOC = os.path.join(TDX, 'vipdoc')
 STAMP = os.path.join(TDX, 'tdx2db.version.json')             # 装的是哪个版本
 
@@ -853,6 +866,20 @@ def _win_tasks(tag=None):
     return sorted(set(names))
 
 
+def _win_slots(names):
+    """`finacial-sync-1600` -> (16, 0)。抠不出来的跳过。
+
+    ★ 名字里带点位是 `install_timer` 定的格式，所以这里能反解出"实际装了
+      哪几个点位"，而不只是"装了几个任务"。
+    """
+    out = []
+    for n in names:
+        m = re.search(r'-(\d{2})(\d{2})$', n)
+        if m:
+            out.append((int(m.group(1)), int(m.group(2))))
+    return sorted(set(out))
+
+
 def _launchd_path(label=LABEL):
     return os.path.expanduser('~/Library/LaunchAgents/%s.plist' % label)
 
@@ -926,8 +953,7 @@ def _plist(label, args, times, tag):
     ★ `times` 是 [(时,分), ...]。多个时间点时 StartCalendarInterval 用
       **数组**（launchd 支持）—— 装三个 plist 会让"改一个点位"变成改三处。
     """
-    log = os.path.join(ROOT, '_manifest', 'launchd-%s.out' % tag)
-    err = os.path.join(ROOT, '_manifest', 'launchd-%s.err' % tag)
+    log, err = _paths.launchd_logs(tag)   # 名字的正本在 paths.py
     if len(times) == 1:
         sched = ('  <dict><key>Hour</key><integer>%d</integer>\n'
                  '        <key>Minute</key><integer>%d</integer></dict>'
@@ -1131,6 +1157,32 @@ def _span(start, end):
     return (b - a) if b >= a else (24 * 60 - a) + b
 
 
+def next_slot(times, now=None):
+    """下一次会在什么时候触发 -> (datetime, 距今多少秒)。没有点位就 (None, None)。
+
+    🔴 **点位不是按时钟升序的** —— 跨午夜那档 `_range_times` 生成的是
+      16:00…23:50, 00:00…09:00, 09:20，直接取"第一个 >= now"会得到 16:00，
+      而现在若是 02:00，真正的下一次是 02:10。**而它不报错**，
+      只是页面上那个"下次扫描"一直在说谎。所以这里自己排序。
+    ★ launchd 的 StartCalendarInterval / schtasks 的每日点位都是**每天触发**，
+      所以今天剩下的取最早那个，一个都不剩就落到明天第一个。
+    ★ 这是纯函数（不读磁盘、不问调度器），判据够得着。
+    """
+    import datetime as _dt
+    if not times:
+        return (None, None)
+    now = now or _dt.datetime.now()
+    ts = sorted(set((int(h), int(m)) for h, m in times))
+    today = now.date()
+    for h, m in ts:
+        cand = _dt.datetime.combine(today, _dt.time(h, m))
+        if cand > now:
+            return (cand, (cand - now).total_seconds())
+    h, m = ts[0]
+    cand = _dt.datetime.combine(today + _dt.timedelta(days=1), _dt.time(h, m))
+    return (cand, (cand - now).total_seconds())
+
+
 def _times(spec):
     """'07:00,08:00' -> [(7,0),(8,0)]。"""
     out = []
@@ -1161,8 +1213,9 @@ def show_schedule():
         d = sc[key]
         want = _range_times(d['from'], d['to'], d['every'])
         got, loaded, err = None, None, None
+        osname = platform.system()
         p = _launchd_path(label)
-        if platform.system() == 'Darwin' and os.path.isfile(p):
+        if osname == 'Darwin' and os.path.isfile(p):
             try:
                 import plistlib
                 pl = plistlib.load(io.open(p, 'rb'))
@@ -1178,6 +1231,17 @@ def show_schedule():
                 loaded = label in lst
             except Exception:                                   # noqa: BLE001
                 pass
+        elif osname == 'Windows':
+            # 🔴 Windows 这一支原来整个没做 —— 页面上"装了几个点位"永远是
+            #   未知，于是「配置改了而任务没重装」这件事在 Windows 上
+            #   **无从发现**（同「只回显配置是不够的」那条）。
+            #   装出来的任务名带点位后缀，所以数出来的就是真实点位数。
+            try:
+                names = _win_tasks(key)
+                got = _win_slots(names)
+                loaded = bool(names)
+            except Exception as e:                              # noqa: BLE001
+                err = str(e)[:120]
         out['installed'][key] = {
             'label': label, 'want_slots': len(want),
             'got_slots': (len(got) if got is not None else None),
@@ -1188,6 +1252,20 @@ def show_schedule():
             #   ★ 跨午夜要让页面说出来（「16:00 ~ 次日 09:20」）
             'wrap': _hhmm(d['from']) > _hhmm(d['to']),
         }
+        # 🔴 **「下一次什么时候跑」要按【实际装上的】点位算，不按配置算。**
+        #   配置改了而没重装时，页面照配置报的那个时刻根本不会发生 ——
+        #   而它不报错（同「判据永远是现在的状态，不是记录」）。
+        #   装的那份读不到（没装 / 这个平台没做）才退回配置，并标出来。
+        src = got if got else want
+        at, left = next_slot(src)
+        out['installed'][key].update({
+            'next_at': at.strftime('%Y-%m-%d %H:%M') if at else None,
+            'next_in': int(left) if left is not None else None,
+            'next_from': 'installed' if got else 'config',
+            # ★ 「开着没有」是页面上那个开关的唯一判据 —— 跨平台统一在这里
+            #   给，别让前端按 `loaded`/`got_slots` 各自拼一遍。
+            'on': bool(got and loaded),
+        })
     return out
 
 

@@ -2,7 +2,8 @@
 """把 tdx 的 ETF 行情搭成一个【assay 引擎能直接吃】的迷你 lake。
 
     python3 datalake/build/build_etf_lake.py
-    python3 assay/run.py <策略> --datalake /Users/guhao/finacial/datalake/etf_lake ...
+    python3 assay/run.py <策略> --datalake datalake/etf_lake ...
+    # ★ 路径写相对的：写死本机绝对路径的用法示例，换台机器照抄就跑不通
 
 ## 为什么要单独一个 lake，而不是把 ETF 塞进主面板
 
@@ -56,13 +57,25 @@ datalake 如实复制、面板如实构建、ETF 回测直接给出 -90% 的假�
 """
 import json
 import os
+import sys
 import shutil
+import subprocess
 
 import duckdb
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, 'etf_lake')
-TDX = os.path.join(ROOT, 'raw', 'tdx', '_ingest', 'tdx.db')
+# ---- datalake 侧路径的正本：`datalake/paths.py` ----
+# 🔴 **往上找它，不数 dirname 层数** —— 层数跟着"这个文件放在哪"变，
+#   搬一次就要改一次，而改漏了不报错（同 assay/paths.py 那条）。找不到就一路
+#   走到文件系统根，导入正本时抛 ImportError —— **响亮失败**，不会静默
+#   退回某个猜出来的路径。
+_d = os.path.dirname(os.path.abspath(__file__))
+while _d != os.path.dirname(_d) and not os.path.isfile(
+        os.path.join(_d, 'paths.py')):
+    _d = os.path.dirname(_d)
+sys.path.insert(0, _d)
+from paths import TDX_DB as TDX                                  # noqa: E402
 START = '2015-01-01'          # 留足动量窗口的预热（策略最长看 240 日）
 
 # 🔴🔴 真 ETF 的代码段。**这一条必须按段精确写，不能只看前 4 位。**
@@ -116,15 +129,50 @@ def jq(sym_expr):
             " THEN '.XSHG' ELSE '.XSHE' END" % (sym_expr, sym_expr))
 
 
+def _link_tree(target, link):
+    """把 `target` 那棵目录挂到 `link` —— **不复制**。
+
+    🔴🔴 **Windows 上 `os.symlink` 要管理员或开发者模式**，否则
+      `OSError: [WinError 1314] A required privilege is not held by the client`
+      —— 而这是每日链的 **9/13**，新机器上整条链会崩在这里。
+    ★ 退路是**目录联接**（junction，`mklink /J`）：它对本地目录**不需要
+      任何权限**，语义与这里要的东西一样（读起来就是那棵目录）。
+    🔴 **不退回"复制"** —— 那是 492 MB，而且主 lake 每天更新、副本
+      **不会跟着变**：ETF 回测会拿着几天前的指数点位跑，**而它不报错**
+      （同「合并去重不能只按一个键…两种都不报错」那类）。宁可响亮失败。
+    """
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return 'symlink'
+    except (OSError, NotImplementedError, AttributeError) as e:
+        if os.name != 'nt':
+            raise
+        first = e
+    r = subprocess.run(['cmd', '/c', 'mklink', '/J', link, target],
+                       capture_output=True, text=True)
+    if r.returncode == 0 and os.path.isdir(link):
+        return 'junction'
+    raise RuntimeError(
+        '挂不上 %s -> %s：符号链接失败（%s），目录联接也失败（%s）。\n'
+        '   下一步：以管理员身份跑一次，或在「设置 -> 隐私和安全性 -> '
+        '开发者选项」里打开【开发人员模式】。\n'
+        '   ⚠ 这里**刻意不退回复制** —— 那是 492 MB 而且不会跟着主 lake '
+        '更新，ETF 回测会拿着旧的指数点位跑而不报错。'
+        % (link, target, first, (r.stderr or r.stdout).strip()[:120]))
+
+
 def main():
     for d in ('mart/panel_daily', 'std', 'raw/tdx'):
         p = os.path.join(OUT, d)
         if not os.path.isdir(p):
             os.makedirs(p)
-    # 基准指数点位软链到主 lake —— 不复制，省 60MB 且永远跟着主 lake 更新
+    # 基准指数点位挂到主 lake —— **不复制**（那是 492 MB，而且副本不会
+    # 跟着主 lake 更新）。★ `os.path.exists` 对 Windows 的目录联接也返回
+    # True，所以这个判据在两边都是幂等的。
     link = os.path.join(OUT, 'raw', 'tdx', 'kline')
     if not os.path.islink(link) and not os.path.exists(link):
-        os.symlink(os.path.join(ROOT, 'raw', 'tdx', 'kline'), link)
+        how = _link_tree(os.path.join(ROOT, 'raw', 'tdx', 'kline'), link)
+        print('  基准指数目录已挂上（%s）' % how)
 
     con = duckdb.connect()
     con.execute("ATTACH '%s' AS tdx (READ_ONLY)" % TDX)

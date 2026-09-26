@@ -62,13 +62,34 @@ def _alive(pid):
     🔴 进程被 kill / 机器重启 / 崩掉时，文件里还留着 `running`。
       只看 state 的话页面会永远显示"正在同步"（同 serve.py 那条
       「判据是谁占着端口，不是 PID 文件」）。
+
+    🔴🔴 **不能直接用 `os.kill(pid, 0)`。** POSIX 上那是"只探测不发信号"的
+      惯用法；而 **Windows 上 `os.kill` 对任何非 `CTRL_*` 的 sig 都走
+      `TerminateProcess`** —— 于是**每打开一次页面、横条读一次进度，
+      就把正在跑的同步进程杀掉**，而它不报错。
+    ★ 同一份实现在 `assay/serve.py` 也有一份（`--stop` 要确认真的停了）——
+      两个仓库，跨仓共享要引依赖，这是明知的取舍。改一处要**两处一起改**。
     """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
     if not pid:
         return False
+    if os.name == 'nt':
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+        k.CloseHandle(h)
+        return bool(ok) and code.value == 259   # STILL_ACTIVE
     try:
-        os.kill(int(pid), 0)
+        os.kill(pid, 0)
         return True
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError):
         return False
 
 
@@ -126,7 +147,13 @@ class Progress(object):
                 t_ = _load(TIMES, {})
                 t_[self.job] = {'at': time.time(), 'total': self.d['total'],
                                 'secs': [x.get('sec') or 0
-                                         for x in self.d['done']]}
+                                         for x in self.d['done']],
+                                # ★ 名字只给**展开面板**用（"接下来是哪几步"）。
+                                #   ETA 仍然按**位置**对齐 —— 步名会改，
+                                #   按名字对会静默对不上（见上面那条）。
+                                #   所以页面上要标明这是"上次跑的时候"的名字。
+                                'names': [x.get('name') or ''
+                                          for x in self.d['done']]}
                 _atomic(TIMES, t_)
             except Exception:                               # noqa: BLE001
                 pass
@@ -172,5 +199,12 @@ def read(job=None):
         d['step_eta'] = (secs[d['i'] - 1] if d['state'] == 'running'
                          and len(secs) == d.get('total') and d['i'] else None)
         d['eta_from'] = prof.get('at')      # 基准是哪次跑出来的 —— 说得出处
+        # 🔴 **未跑那几步的名字与预计耗时**（展开面板要列出"接下来做什么"）。
+        #   来自上一次完整跑的剖面，所以页面必须标「上次」——
+        #   链加过步骤的话它就是过期的，而那不报错（同「不猜一个数」）。
+        d['plan'] = None
+        if len(secs) == d.get('total') and prof.get('names'):
+            d['plan'] = [{'name': n, 'sec': c}
+                         for n, c in zip(prof['names'], secs)]
         out.append(d)
     return out

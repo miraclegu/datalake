@@ -12,8 +12,21 @@
 
 设计原则同 probe_jq.py: 每个探测独立捕获, 但**失败必须打印原因**, 不静默。
 """
+import os
 import sys
 import traceback
+
+# ---- datalake 侧路径的正本：`datalake/paths.py` ----
+# 🔴 **往上找它，不数 dirname 层数** —— 层数跟着"这个文件放在哪"变，
+#   搬一次就要改一次，而改漏了不报错（同 assay/paths.py 那条）。找不到就一路
+#   走到文件系统根，导入正本时抛 ImportError —— **响亮失败**，不会静默
+#   退回某个猜出来的路径。
+_d = os.path.dirname(os.path.abspath(__file__))
+while _d != os.path.dirname(_d) and not os.path.isfile(
+        os.path.join(_d, 'paths.py')):
+    _d = os.path.dirname(_d)
+sys.path.insert(0, _d)
+from paths import TDX_DB                                  # noqa: E402
 
 RESULTS = []
 
@@ -139,7 +152,7 @@ def _b5():
     res = [f"不复权日线字段={list(df.columns)}, {len(df)} 行"]
     try:
         import duckdb
-        con = duckdb.connect('/Users/guhao/finacial/tdx2db/tdx.db', read_only=True)
+        con = duckdb.connect(TDX_DB, read_only=True)
         t = con.execute("""SELECT date, close FROM v_stock_bfq
                            WHERE symbol='sh600000' AND date BETWEEN '2026-08-01' AND '2026-08-21'
                            ORDER BY date""").df()

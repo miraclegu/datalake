@@ -1,0 +1,28 @@
+# 两个仓库（assay + datalake）跑起来需要的全部第三方包 —— 就这 4 个。
+#
+#     python3 -m pip install -r datalake/requirements.txt
+#
+# 🔴 **缺了 duckdb 连 `serve.py` 都起不来**（实测：屏蔽掉它之后
+#   `import assay.server` 直接 ModuleNotFoundError）—— 也就是说
+#   「下载完直接启动」这一步在装包之前是走不通的，而报错只是一句
+#   裸 ModuleNotFoundError，指不到"该装什么"。
+#
+# 🔴 **Python 需要 3.10+**：`assay/hashseed.py` 用了 `sys.orig_argv`
+#   （3.10 才有），而那是固定 hash 种子、保证回测跨进程可复现的入口。
+#
+# ★ 清单是**扫出来的**，不是凭印象列的：扫两个仓库运行时那批 .py 的
+#   import，减去标准库与本仓模块。测试另需 playwright（`--web` 那层），
+#   不在这里 —— 它不是"跑起来"的必要条件。
+# ⚠ `raw/amazing/` 与 `raw/hf/` 两条侧链另有依赖（AmazingData / httpx /
+#   pypdf），但主链一个都不碰它们（CLAUDE.md 里写明了不用 `raw/hf/`）。
+#
+# ★ 实测 `import assay.server` 还会拉进 cloudpickle / dateutil / six /
+#   cython_runtime —— 那是 **pandas / pyarrow 自己的传递依赖**，pip 会
+#   一起装，所以不列在这里（列了反而像是我们自己要用）。
+#
+# 本机实测版本（2026-09-26，macOS + Python 3.13.3）：
+#   duckdb 1.5.3 · pandas 3.0.1 · numpy 2.2.6 · pyarrow 23.0.1
+duckdb>=1.0
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14.0

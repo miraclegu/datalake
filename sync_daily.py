@@ -75,9 +75,7 @@ load_tdx_kline 覆盖写、panel 按年重建、beta 全量重算。中途失败
 """
 
 import argparse
-import glob
 import os
-import platform
 import subprocess
 import sys
 import time
@@ -85,26 +83,25 @@ from datetime import datetime, timedelta
 
 DL = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(DL)
-# 🔴 **不走 `ROOT/tdx2db` 那个符号链接** —— 它在 macOS 上指向
-#   `datalake/raw/tdx/_ingest`，而 Windows 上 clone 出来多半没有这个链接
-#   （要管理员/开发者模式才建得了）。直接解到真实路径，链接只是方便。
-TDX = os.path.join(DL, 'raw', 'tdx', '_ingest')
+# ---- datalake 侧路径的正本：`datalake/paths.py` ----
+# 🔴 **往上找它，不数 dirname 层数** —— 层数跟着"这个文件放在哪"变，
+#   搬一次就要改一次，而改漏了不报错（同 assay/paths.py 那条）。找不到就一路
+#   走到文件系统根，导入正本时抛 ImportError —— **响亮失败**，不会静默
+#   退回某个猜出来的路径。
+_d = os.path.dirname(os.path.abspath(__file__))
+while _d != os.path.dirname(_d) and not os.path.isfile(
+        os.path.join(_d, 'paths.py')):
+    _d = os.path.dirname(_d)
+sys.path.insert(0, _d)
+from paths import TDX_DIR as TDX, tdx2db_bin, launchd_logs                    # noqa: E402
+import logs as _logs                                                          # noqa: E402
 LOGDIR = os.path.join(DL, '_manifest', 'sync_logs')
 STATUS = os.path.join(DL, '_manifest', 'sync_status.json')
 PY = sys.executable
-KEEP_LOGS = 60
-
-
-def tdx2db_bin():
-    """tdx2db 可执行文件 —— Windows 上是 `.exe`。
-
-    ★ 上游（github.com/jing2uo/tdx2db）**有 Windows_x86_64 预编译包**，
-      `setup_tdx.py --install` 的 ASSETS 表里本来就映射着它。
-    ★ 找不到时**不在这里报错**：照常返回路径，让那一步响亮失败并进
-      STEPS_BAD —— 于是 5~13 跳过、当天不出信号，那正是想要的行为。
-    """
-    exe = 'tdx2db.exe' if platform.system() == 'Windows' else 'tdx2db'
-    return os.path.join(TDX, exe)
+# 🔴 **按【天】保留，不按份数。** 轮询是每 10 分钟一个点位，而"齐了就
+#   秒退不建文件" —— 于是"60 份"在忙的日子只盖得住两三天、闲的日子盖住
+#   半年，**而它不报错**，只是"留多久"这件事说不清。
+KEEP_DAYS = 30
 
 
 # 🔴 **链有几步只写这一处。** 搬运前 `.sh` 里前九步写 `x/12`、后四步写
@@ -220,6 +217,13 @@ def main():
     ap.add_argument('--if-stale', action='store_true', help='数据齐了就秒退')
     a = ap.parse_args()
 
+    # 🔴 **裁日志要排在 `--if-stale` 提前返回【之前】。** 轮询每 10 分钟一个
+    #   点位，绝大多数时候走的就是那条提前返回，而它也会往 launchd 的 .out
+    #   里写一行 —— 放到后面的话**最常走的那条路永远裁不到**，日志照旧涨，
+    #   而它不报错（同 tick 里「模拟盘推进要排在提前返回之前」那条）。
+    for _p in launchd_logs('sync'):
+        _logs.trim_by_days(_p, days=KEEP_DAYS)
+
     if a.if_stale and not _if_stale():
         return 0
 
@@ -330,14 +334,8 @@ def main():
     if r.pg:
         r.pg.finish(0 if not r.bad else 1)
 
-    # 只保留最近 KEEP_LOGS 份
-    try:
-        fs = sorted(glob.glob(os.path.join(LOGDIR, '*.log')),
-                    key=os.path.getmtime, reverse=True)
-        for f in fs[KEEP_LOGS:]:
-            os.remove(f)
-    except OSError:
-        pass
+    # 只保留最近 KEEP_DAYS 天（`keep_min` 防系统时间跳变把目录清空）
+    _logs.prune_dir_by_days(LOGDIR, '*.log', days=KEEP_DAYS, keep_min=5)
     return 0 if not r.bad else 1
 
 

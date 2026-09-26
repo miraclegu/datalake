@@ -37,7 +37,17 @@ import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # datalake
-TDX_DB = os.path.join(ROOT, 'raw', 'tdx', '_ingest', 'tdx.db')
+# ---- datalake 侧路径的正本：`datalake/paths.py` ----
+# 🔴 **往上找它，不数 dirname 层数** —— 层数跟着"这个文件放在哪"变，
+#   搬一次就要改一次，而改漏了不报错（同 assay/paths.py 那条）。找不到就一路
+#   走到文件系统根，导入正本时抛 ImportError —— **响亮失败**，不会静默
+#   退回某个猜出来的路径。
+_d = os.path.dirname(os.path.abspath(__file__))
+while _d != os.path.dirname(_d) and not os.path.isfile(
+        os.path.join(_d, 'paths.py')):
+    _d = os.path.dirname(_d)
+sys.path.insert(0, _d)
+from paths import TDX_DB                                  # noqa: E402
 PANEL = os.path.join(ROOT, 'mart', 'panel_daily')
 CLOSE_AFTER = '15:00'          # 收盘（含集合竞价收尾）之后才认当天数据
 MIN_RATIO = 0.95               # 今天的只数至少是上一交易日的这个比例

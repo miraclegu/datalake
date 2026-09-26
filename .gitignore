@@ -26,6 +26,10 @@
 # 4a) 依赖清单 = 代码。没有它，换一台机器装出来的环境不一样，
 #     而"不一样"的表现不是报错，是某个接口静默少写一列（见那个 tables 包）。
 !raw/amazing/_ingest/requirements.txt
+#     ★ 根上那份是【主链】的（duckdb/pandas/numpy/pyarrow）——
+#       不放行的话它提交不进去，新 clone 上既没有清单、
+#       守卫也会直接红（本轮实测踩到）。
+!requirements.txt
 
 # 4b) 调度配置 = 代码。launchd 的 plist 决定每日同步几点跑，
 #     丢了就等于同步默默停了（而"停了"这件事本身不报错）。

@@ -47,6 +47,18 @@ import subprocess
 import sys
 import time
 
+# ---- datalake 侧路径的正本：`datalake/paths.py` ----
+# 🔴 **往上找它，不数 dirname 层数** —— 层数跟着"这个文件放在哪"变，
+#   搬一次就要改一次，而改漏了不报错（同 assay/paths.py 那条）。找不到就一路
+#   走到文件系统根，导入正本时抛 ImportError —— **响亮失败**，不会静默
+#   退回某个猜出来的路径。
+_d = os.path.dirname(os.path.abspath(__file__))
+while _d != os.path.dirname(_d) and not os.path.isfile(
+        os.path.join(_d, 'paths.py')):
+    _d = os.path.dirname(_d)
+sys.path.insert(0, _d)
+from paths import TDX_DB                                  # noqa: E402
+
 ROOT = os.path.dirname(os.path.abspath(__file__))            # datalake/
 REPO = os.path.dirname(ROOT)                                 # finacial/
 ASSAY = os.path.join(REPO, 'assay')
@@ -281,7 +293,7 @@ def fingerprint():
     # tdx.db 的四张表：行数 + 区间（比文件 md5 更有意义 —— 它证明内容）
     try:
         import duckdb
-        c = duckdb.connect(os.path.join(ROOT, 'raw/tdx/_ingest/tdx.db'),
+        c = duckdb.connect(TDX_DB,
                            read_only=True)
         for t in ('raw_kline_daily', 'raw_adjust_factor', 'raw_basic_daily',
                   'raw_symbol_class', 'raw_gbbq'):

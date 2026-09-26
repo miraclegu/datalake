@@ -22,11 +22,22 @@ import argparse
 import datetime
 import json
 import os
+import sys
 
 import duckdb
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TDX = os.path.join(os.path.dirname(ROOT), 'tdx2db', 'tdx.db')
+# ---- datalake 侧路径的正本：`datalake/paths.py` ----
+# 🔴 **往上找它，不数 dirname 层数** —— 层数跟着"这个文件放在哪"变，
+#   搬一次就要改一次，而改漏了不报错（同 assay/paths.py 那条）。找不到就一路
+#   走到文件系统根，导入正本时抛 ImportError —— **响亮失败**，不会静默
+#   退回某个猜出来的路径。
+_d = os.path.dirname(os.path.abspath(__file__))
+while _d != os.path.dirname(_d) and not os.path.isfile(
+        os.path.join(_d, 'paths.py')):
+    _d = os.path.dirname(_d)
+sys.path.insert(0, _d)
+from paths import TDX_DB as TDX                                  # noqa: E402
 CAL = os.path.join(os.path.dirname(ROOT), 'assay', 'live', 'trade_calendar.json')
 
 # (键, 人读名, 属于哪条腿, SQL)

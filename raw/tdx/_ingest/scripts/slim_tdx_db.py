@@ -32,6 +32,18 @@ from pathlib import Path
 
 import duckdb
 
+# ---- datalake 侧路径的正本：`datalake/paths.py` ----
+# 🔴 **往上找它，不数 dirname 层数** —— 层数跟着"这个文件放在哪"变，
+#   搬一次就要改一次，而改漏了不报错（同 assay/paths.py 那条）。找不到就一路
+#   走到文件系统根，导入正本时抛 ImportError —— **响亮失败**，不会静默
+#   退回某个猜出来的路径。
+_d = os.path.dirname(os.path.abspath(__file__))
+while _d != os.path.dirname(_d) and not os.path.isfile(
+        os.path.join(_d, 'paths.py')):
+    _d = os.path.dirname(_d)
+sys.path.insert(0, _d)
+from paths import TDX_DB                                  # noqa: E402
+
 BLOCK = 262144
 
 # ── 保留集: 日常脚本 + tdx2db cron 必需, 不可删 ────────────────────────────────
@@ -172,7 +184,7 @@ def verify_table(con, table, use_float, cols):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="tdx.db 瘦身: 重建到新文件, 原库只读不动")
-    ap.add_argument("--db", default="/Users/guhao/finacial/tdx2db/tdx.db")
+    ap.add_argument("--db", default=TDX_DB)
     ap.add_argument("--out", default=None, help="默认 <db 同目录>/tdx_new.db")
     ap.add_argument("--execute", action="store_true", help="真正执行; 缺省只 dry-run")
     ap.add_argument("--float", dest="use_float", action="store_true",
