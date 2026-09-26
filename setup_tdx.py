@@ -817,7 +817,40 @@ SCHED_LIMITS = {'every_min': 5, 'every_max': 240, 'max_slots': 100}
 #   还没抓），所以**完整链每个交易日至少跑一次** —— `daily_snapshot.py`
 #   漏一天永久丢失，这条保证不能靠"数据恰好齐了"。
 
-SH = os.path.join(ROOT, 'sync_daily.sh')
+# 🔴 定时器跑的是**正本** `sync_daily.py`（纯 Python，跨平台）。
+#   `.sh` 只是一行转发，留着是因为 launchd plist 与文档里都写着它
+#   —— 但**定时任务不能走它**：Windows 上没有 `/bin/bash`，
+#   装出来的计划任务会**建成功、到点执行失败**，而失败只写在任务历史里。
+SYNC_PY = os.path.join(ROOT, 'sync_daily.py')
+SH = os.path.join(ROOT, 'sync_daily.sh')      # 只用于认出老的 cron 条目
+
+
+def _win_tasks(tag=None):
+    """列出**我们装的**那些 Windows 计划任务名。
+
+    🔴 这一处定义是必须的，因为装的名字带点位后缀
+      （`finacial-sync-1600`、`…-1610`…每个点位一个任务），
+      而查与删原来写的是不带后缀的 `finacial-sync` —— 那个名字
+      **根本不存在**。后果两条，都不报错：
+        · `_timer_status` 永远显示"未安装"，哪怕刚装完
+        · `uninstall_timer` 一个都删不掉，而它照样说"已卸载"
+      三处各拼一遍名字迟早分叉，所以只在这里拼。
+    """
+    pre = 'finacial-%s-' % tag if tag else 'finacial-'
+    try:
+        out = subprocess.run(['schtasks', '/query', '/fo', 'csv', '/nh'],
+                             capture_output=True, text=True, timeout=60)
+    except Exception:                                       # noqa: BLE001
+        return []
+    if out.returncode != 0:
+        return []
+    names = []
+    for line in (out.stdout or '').splitlines():
+        # CSV 第一列是任务名，根文件夹下带前导反斜杠："\finacial-sync-1600"
+        cell = line.split('","')[0].strip('"').lstrip('\\')
+        if cell.startswith(pre):
+            names.append(cell)
+    return sorted(set(names))
 
 
 def _launchd_path(label=LABEL):
@@ -856,10 +889,8 @@ def _timer_status():
                                  text=True).stdout
             return 'cron 已装' if SH in out else '未安装（systemd/cron）'
         if osname == 'Windows':
-            out = subprocess.run(
-                ['schtasks', '/query', '/tn', 'finacial-sync'],
-                capture_output=True, text=True)
-            return '计划任务已装' if out.returncode == 0 else '未安装（schtasks）'
+            n = len(_win_tasks('sync'))
+            return ('计划任务已装（%d 个点位）' % n) if n else '未安装（schtasks）'
     except FileNotFoundError:
         return '查不了（调度器命令不在 PATH）'
     except Exception as e:                                  # noqa: BLE001
@@ -942,12 +973,16 @@ def _verify_sched_env():
     🔴 装完必须验 —— "plist 写出去了"不等于"到点跑得起来"。
       不验的话，坏了也要等到明天、而且只写在日志里。
     """
+    # 🔴 验的必须是**定时器真正会用的那个解释器**（`sys.executable`），
+    #   不是字面量 `python3` —— Windows 上没有 `python3` 这个名字，
+    #   于是这条自证在 Windows 上必然 FileNotFoundError，
+    #   而它本该是"到点跑不跑得起来"的唯一判据。
     env = dict(os.environ, PATH=_sched_path())
-    r = subprocess.run(['python3', '-c', 'import duckdb, sys;'
+    r = subprocess.run([sys.executable, '-c', 'import duckdb, sys;'
                         ' print(sys.executable)'],
                        capture_output=True, text=True, env=env, timeout=60)
     if r.returncode != 0:
-        _say('  🔴 定时任务的 PATH 里那个 python3 跑不了 import duckdb：')
+        _say('  🔴 定时任务要用的那个解释器跑不了 import duckdb：')
         _say('     %s' % (r.stderr or '').strip()[:200])
         _say('     PATH=%s' % _sched_path())
         _say('     -> 到点会炸在 2/6 PIT 快照（漏一天不可逆），先修这个')
@@ -1156,6 +1191,39 @@ def show_schedule():
     return out
 
 
+def build_jobs(sc):
+    """两个定时任务各自「跑什么命令、在哪些时间点」。
+
+    🔴 **抽成函数是为了让判据够得着。** 原来它是 `install_timer` 里的
+      局部变量，于是"定时器到底跑的什么"在用例里**不可观测** ——
+      守卫只能自己构造一份参数去调 `_plist`，而那证明不了真实装的是什么。
+      实测代价：sync 那条写着 `/bin/bash …sync_daily.sh` 一直没人发现，
+      而 **Windows 上根本没有 `/bin/bash`**（计划任务建得成功、到点失败、
+      失败只写在任务历史里），两条守卫却一直是绿的。
+    """
+    return [
+        # 🔴 带 --if-stale：判据是"数据齐没齐"，不是"到点没到点"。
+        #   齐了就秒退（连日志文件都不建），所以密集轮询的成本很低。
+        # 🔴 用 `sys.executable` 不是 `/bin/bash …sh`，也不是字面量
+        #   `python3` —— 前者在 Windows 上根本没有，后者在 launchd 那种
+        #   窄环境里会解析到**系统那个**（没装 duckdb）。
+        #   `sys.executable` 是跑本脚本的解释器的绝对路径，两个问题一起解决。
+        #   ★ 下面 tick 那条**本来就是这么写的** —— 这里是把分叉的那半补齐。
+        (LABEL, [sys.executable, SYNC_PY, '--if-stale'],
+         _range_times(sc['sync']['from'], sc['sync']['to'],
+                      sc['sync']['every']), 'sync',
+         '数据同步（%s~%s 每 %d 分钟）'
+         % (sc['sync']['from'], sc['sync']['to'], sc['sync']['every'])),
+        # ★ tick 也是轮询：它的判据是"数据指纹变了吗"（tick_daily.py），
+        #   没变就跳过 —— 所以每小时问一次几乎没成本。
+        (TICK_LABEL, [sys.executable, TICK_PY],
+         _range_times(sc['tick']['from'], sc['tick']['to'],
+                      sc['tick']['every']), 'tick',
+         '信号重算（%s~%s 每 %d 分钟）'
+         % (sc['tick']['from'], sc['tick']['to'], sc['tick']['every'])),
+    ]
+
+
 def install_timer(at=None, tick_at=None):
     """装两个定时：数据同步（sync）与信号重算（tick）。
 
@@ -1163,8 +1231,8 @@ def install_timer(at=None, tick_at=None):
       而"漏装了"的表现是**信号永远是昨晚 18:10 那份**，不报错。
     """
     osname = platform.system()
-    if not os.path.isfile(SH):
-        raise SystemExit('🔴 找不到 %s' % SH)
+    if not os.path.isfile(SYNC_PY):
+        raise SystemExit('🔴 找不到 %s' % SYNC_PY)
     if not os.path.isfile(TICK_PY):
         raise SystemExit('🔴 找不到 %s' % TICK_PY)
     ok = _verify_sched_env()
@@ -1181,22 +1249,7 @@ def install_timer(at=None, tick_at=None):
     ok, why = check_schedule(sc)
     if not ok:
         raise SystemExit('🔴 配置不合法：%s' % why)
-    JOBS = [
-        # 🔴 带 --if-stale：判据是"数据齐没齐"，不是"到点没到点"。
-        #   齐了就秒退（连日志文件都不建），所以密集轮询的成本很低。
-        (LABEL, ['/bin/bash', SH, '--if-stale'],
-         _range_times(sc['sync']['from'], sc['sync']['to'],
-                      sc['sync']['every']), 'sync',
-         '数据同步（%s~%s 每 %d 分钟）'
-         % (sc['sync']['from'], sc['sync']['to'], sc['sync']['every'])),
-        # ★ tick 也是轮询：它的判据是"数据指纹变了吗"（tick_daily.py），
-        #   没变就跳过 —— 所以每小时问一次几乎没成本。
-        (TICK_LABEL, [sys.executable, TICK_PY],
-         _range_times(sc['tick']['from'], sc['tick']['to'],
-                      sc['tick']['every']), 'tick',
-         '信号重算（%s~%s 每 %d 分钟）'
-         % (sc['tick']['from'], sc['tick']['to'], sc['tick']['every'])),
-    ]
+    JOBS = build_jobs(sc)
     if osname == 'Darwin':
         for label, args, times, tag, what in JOBS:
             p = _launchd_path(label)
@@ -1264,8 +1317,13 @@ def install_timer(at=None, tick_at=None):
                       '/st', '%02d:%02d' % (hh, mm), '/f'], check=False)
             _say('✅ %s：%s' % (what, ' / '.join(
                 '%02d:%02d' % t for t in times)))
-        _say('   ⚠️ sync_daily.sh 是 bash 脚本 —— Windows 上要有 '
-             'Git Bash / WSL，且 tdx2db 要用 Windows 版')
+        _say('   ✓ 跑的是 %s（纯 Python）—— Windows 上不需要 '
+             'Git Bash / WSL' % os.path.basename(SYNC_PY))
+        n = len(_win_tasks())
+        # 「发过创建命令」不等于「装上了」 —— 装完必须回头数一遍
+        # （同 launchd 那条：判据是 launchctl list 里到底有没有）。
+        _say('   %s 实际装上 %d 个计划任务'
+             % ('✅' if n else '🔴', n))
     else:
         raise SystemExit('🔴 %s 上没做定时安装' % osname)
     return 0
@@ -1284,10 +1342,19 @@ def uninstall_timer():
             _run(['systemctl', '--user', 'disable', '--now',
                   'finacial-%s.timer' % tag], check=False)
     elif osname == 'Windows':
-        _run(['schtasks', '/delete', '/tn', 'finacial-sync', '/f'],
-             check=False)
-        _run(['schtasks', '/query', '/tn', 'finacial-tick-0700'],
-             check=False)
+        # 🔴 原来写的是删 `finacial-sync`（不存在的名字）+ 对 tick
+        #   执行 `/query`（**查询不是删除**）—— 于是一个都没删掉，
+        #   而命令返回码被 check=False 吞了，末尾照样打印"已卸载"。
+        names = _win_tasks()
+        for tn in names:
+            _run(['schtasks', '/delete', '/tn', tn, '/f'], check=False)
+        left = _win_tasks()
+        # 判据是**现在还剩几个**，不是命令返回码（同 launchd 那条：
+        # 判据永远是"现在到底还在不在"，不是"发过删除命令没有"）。
+        _say('   删了 %d 个计划任务%s'
+             % (len(names) - len(left),
+                ('，还剩 %d 个没删掉：%s' % (len(left), ', '.join(left)))
+                if left else ''))
     _say('🔴 关掉之后 daily_snapshot 就不跑了 —— 它【漏一天永久丢失】'
          '（tdx 的名称/分类/板块成分是 type-1 覆盖写）。')
     _say('   而"关了自动同步"本身不报错，几个月后才会发现历史缺口。')
