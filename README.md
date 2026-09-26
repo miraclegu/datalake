@@ -1,5 +1,8 @@
 # datalake — 本地量化数据平台
 
+> 🆕 **第一次装？看 [../assay/INSTALL.md](../assay/INSTALL.md)** ——
+> macOS / Windows 逐步来，假设你什么都没装过。本文档是**已经装好之后**的参考。
+
 > 一个项目负责**采集 / 清洗 / 加工**。回测与研究只从这里取数。
 > 架构：`docs/requirements/datalake-3layer-plan.md`
 > PIT 语义：`docs/requirements/pit-database-plan.md`
