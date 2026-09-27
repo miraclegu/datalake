@@ -319,7 +319,7 @@ def _zip_ready(p):
     return True, '%.0f MB' % (sz / 1e6)
 
 
-def _download(url, dst, expect=None):
+def _download(url, dst, expect=None, is_zip=False):
     """带进度的下载。★ 先写 .part 再 rename —— 中断的半个文件不许占正名，
     否则下次跑会把半个 zip 当成"已经下好了"。"""
     tmp = dst + '.part'
@@ -327,6 +327,13 @@ def _download(url, dst, expect=None):
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=60) as r:
         total = int(r.headers.get('Content-Length') or 0)
+        ctype = r.headers.get('Content-Type')
+        # ★ 服务端到底说了什么，当场打出来 —— 这一行就能把"下到的是
+        #   拦截页"与"网络慢"分开（本机实测：200 · application/zip ·
+        #   550.8 MB；出问题那台上会是个几 KB 的 text/html）。
+        _say('  HTTP %s · %s · %.1f MB' % (getattr(r, 'status', '?'),
+                                           ctype or '(没给 Content-Type)',
+                                           total / 1e6))
         got = 0
         with open(tmp, 'wb') as f:
             while True:
@@ -341,10 +348,14 @@ def _download(url, dst, expect=None):
                         got / 1e6 / max(time.time() - t0, .1)))
                     sys.stdout.flush()
     sys.stdout.write('\n')
-    # 🔴 **空响应一律当失败** —— 服务端返回 200 + 空 body 时 got 是 0，
-    #   而 rename 上去就成了一个"看着下好了"的 0 字节文件，之后每次跑
-    #   都 BadZipFile（同 realtime「东财限流返回 data:null，当成'这只票
-    #   没数据'会把持仓价悄悄清空」）。
+    # 🔴🔴 **判据是「下回来的是不是一个 zip」，不是「下了多少字节」。**
+    #   2026-09-27 真机实测：那台机器上服务端（多半是网关/代理的拦截页）
+    #   返回 **200 + Content-Length 对得上的几 KB 正文**，于是
+    #   「空响应」与「长度不符」两道**都放行**，rename 上去就成了一个
+    #   看着正常的 hsjday.zip —— 下一次跑判成"残骸"删掉、再下同一个页面，
+    #   **死循环**（用户那边连着两轮一模一样）。
+    #   这正是我这一轮刚写下却只用在【缓存那份】上的那条判据：
+    #   **问的是文件对不对，不是文件在不在**。
     if got == 0:
         os.remove(tmp)
         raise SystemExit('  ✗ 一个字节都没下到（服务端给了空响应）—— '
@@ -358,8 +369,36 @@ def _download(url, dst, expect=None):
     if expect and os.path.getsize(tmp) != expect:
         os.remove(tmp)
         raise SystemExit('  ✗ 大小不对：期望 %d，实得 %d' % (expect, got))
+    if is_zip:
+        _check_zip(tmp, url, got, ctype)
     os.replace(tmp, dst)
     return dst
+
+
+def _check_zip(tmp, url, got, ctype):
+    """刚下回来的这份到底是不是 zip —— 不是就【不落地】，并说清收到了什么。
+
+    ★ 坏的那份**留成 `.part`**（不删）：它是证据。同 realtime 那条
+      「隔离不是删除 —— 这次就是靠那 2078 字节确认了并发写」。
+    """
+    with open(tmp, 'rb') as f:
+        head = f.read(512)
+    if head[:4] in (b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08'):
+        return
+    # 能印出来的部分原样给出去 —— 拦截页/登录页的第一行往往直接说了原因
+    txt = head.decode('utf-8', 'replace').replace('\r', ' ').replace('\n', ' ')
+    txt = ' '.join(txt.split())[:200]
+    raise SystemExit(
+        '  ✗ 下回来的不是 zip（开头是 %r，应为 PK\\x03\\x04）\n'
+        '    收到 %.3f MB，Content-Type: %s\n'
+        '    正文开头：%s\n'
+        '    —— 期望的是 548 MB 的日线包，所以这多半是【网关/代理的拦截页】\n'
+        '       或需要登录。坏的那份留在 %s（证据，可以删）。\n'
+        '    下一步：换个网络重跑；或者用浏览器下 %s，\n'
+        '            存成 %s 之后再跑一次（已经在那儿的合法 zip 会直接用）。'
+        % (head[:4], got / 1e6, ctype or '(没给)', txt or '(空)',
+           tmp, url, tmp[:-5]))
+
 
 
 # ------------------------------------------------------------------ 体检
@@ -719,7 +758,7 @@ def bootstrap(allow_shrink=False, keep_zip=False, reuse_vipdoc=False):
                 _say('🔴 %s %s —— 删掉重下' % (os.path.basename(zp), why))
                 os.remove(zp)
             _say('下载全量日线包（约 548 MB）…')
-            _download(VIPDOC_URL, zp)
+            _download(VIPDOC_URL, zp, is_zip=True)
         # 坏包早失败：解之前先验一次（同上传聚宽包那条）
         _say('校验 zip…')
         with zipfile.ZipFile(zp) as z:
