@@ -107,6 +107,7 @@ def stages(DL=DL, ROOT=ROOT):
         'state': 'ok' if ver else 'todo',
         'detail': ver or '还没装 —— 点右边装（约 25 MB）',
         'cmd': [py, os.path.join(DL, 'setup_tdx.py'), '--install'],
+        'eta_min': (1, 1),
         'eta': '约 1 分钟'})
 
     # ② tdx.db（全量日线）
@@ -124,6 +125,7 @@ def stages(DL=DL, ROOT=ROOT):
         'detail': ('%.1f GB' % (os.path.getsize(db) / 1e9)) if os.path.isfile(db)
                   else '还没有 —— 要先装好 ①',
         'cmd': [py, os.path.join(DL, 'setup_tdx.py'), '--bootstrap'],
+        'eta_min': (30, 60),
         'eta': '约 30~60 分钟（下载为主）'})
 
     # ③ std（交易日历 / 分红 / 财务的规范层）
@@ -135,6 +137,7 @@ def stages(DL=DL, ROOT=ROOT):
         'state': 'ok' if r and r[0] else 'todo',
         'detail': ('交易日历到 %s' % str(r[0])[:10]) if r and r[0] else '还没有',
         'cmd': [py, os.path.join(DL, 'build', 'load_tdx_kline.py')],
+        'eta_min': (2, 2),
         'eta': '约 2 分钟'})
 
     # ④ 面板 —— **回测与看板的地基**，没有它几乎所有页面都是空的
@@ -147,6 +150,7 @@ def stages(DL=DL, ROOT=ROOT):
             os.path.join(DL, 'mart', 'panel_daily', 'panel_*.parquet')))) if pd_
             else '还没有 —— 要先有 ③',
         'cmd': [py, os.path.join(DL, 'build', 'build_panel_daily.py')],
+        'eta_min': (6, 6),
         'eta': '全量约 6 分钟'})
 
     # ⑤ 因子面板（研究链，实盘不读）
@@ -158,6 +162,7 @@ def stages(DL=DL, ROOT=ROOT):
         'state': 'ok' if nf else 'todo',
         'detail': ('%d 个年文件' % nf) if nf else '还没有 —— 要先有 ④',
         'cmd': [py, os.path.join(DL, 'build', 'build_factor_daily.py')],
+        'eta_min': (30, 30),
         'eta': '全量约 30 分钟'})
 
     # ⑥ 因子评价分片（增量）
@@ -168,6 +173,7 @@ def stages(DL=DL, ROOT=ROOT):
         'state': 'ok' if ns else 'todo',
         'detail': ('%d 片 IC' % ns) if ns else '还没有 —— 要先有 ⑤',
         'cmd': [py, os.path.join(ROOT, 'assay', 'assay', 'factor_eval.py'), '--build-only'],
+        'eta_min': (44, 44),
         'eta': '首建约 44 分钟'})
 
     # ⑦ B 腿：聚宽财务（**人工**）
@@ -185,6 +191,50 @@ def stages(DL=DL, ROOT=ROOT):
     return out
 
 
+
+def _fmt_mins(m, unit=None):
+    """分钟 -> 人话。90 分钟以上折成小时，免得出现「约 143 分钟」。
+
+    ★ `unit` 是给**区间**用的：两端必须同一个单位，不然会写出
+      「69 分钟~1.6 小时」这种要在脑子里换算一次的东西。
+    """
+    if unit is None:
+        unit = 'min' if m < 90 else 'h'
+    if unit == 'min':
+        return '%d 分钟' % round(m)
+    h = m / 60.0
+    return ('%d 小时' % round(h)) if abs(h - round(h)) < 0.05 else '%.1f 小时' % h
+
+
+def _eta_total(todo):
+    """把还要跑的那几步的时长**加起来**，给一个总数（不是把文案串起来）。
+
+    ★ 只算**能自动跑**的（`cmd`）：⑦ 财务数据是人工那一步，把它算进
+      「还要多久」里没有意义。
+    ★ 一步都没声明时长就返回 None —— **不猜一个数**（同「拿不到分红那一格
+      标查不到」）。
+    """
+    lo = hi = 0
+    n = 0
+    for s in todo:
+        if not s.get('cmd'):
+            continue
+        em = s.get('eta_min')
+        if not em:
+            continue
+        lo += em[0]
+        hi += em[1]
+        n += 1
+    if not n:
+        return None
+    if lo == hi:
+        return _fmt_mins(lo)
+    u = 'min' if hi < 90 else 'h'          # 两端同单位
+    # ★ 低端**不重复写单位**：「1.9 小时~2.4 小时」里那个「小时」是噪声。
+    suf = ' 分钟' if u == 'min' else ' 小时'
+    return '%s~%s' % (_fmt_mins(lo, u).replace(suf, ''), _fmt_mins(hi, u))
+
+
 def summary(DL=DL, ROOT=ROOT):
     """一句话：还差几步、下一步该点哪个。"""
     st = stages(DL, ROOT)
@@ -198,10 +248,13 @@ def summary(DL=DL, ROOT=ROOT):
             'n_auto': len(auto),
             'n_auto_todo': len([s for s in todo if s.get('cmd')]),
             'n_manual_todo': len([s for s in todo if not s.get('cmd')]),
-            # 粗估总时长：只把**能自动跑**的那几步的估计拼起来。
-            # ⚠ 是各阶段自己声明的估计，不是实测 —— 页面上要写「估」。
-            'eta_text': ' + '.join(
-                s['eta'] for s in todo if s.get('cmd') and s.get('eta')) or None,
+            # 粗估总时长：把**能自动跑**的那几步【加起来】给一个数。
+            # 🔴 原来是 `' + '.join(各步的中文 eta)` —— 屏幕上就成了
+            #   「约需 约 1 分钟 + 约 30~60 分钟（下载为主） + 约 2 分钟 +
+            #     全量约 6 分钟 + …」这种读不通的串接，而人要的是**一个总数**。
+            #   所以每步另给机器可读的 `eta_min`（下限, 上限），这里求和。
+            # ⚠ 仍是各阶段自己声明的估计，不是实测 —— 页面上要写「估」。
+            'eta_text': _eta_total(todo),
             'ready': not todo,
             'os': platform.system()}
 
