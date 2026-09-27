@@ -319,11 +319,29 @@ def _zip_ready(p):
     return True, '%.0f MB' % (sz / 1e6)
 
 
+# 🔴🔴 **不要用 `curl/8` 这种一眼是机器人的 UA。**
+#   2026-09-27 真机实测：`data.tdx.com.cn` 前面挂着**腾讯云 EdgeOne 的
+#   Bot 管理**，`curl/8` 拿回来的是一段混淆 JS（正文里有 `EO_Bot_Ssid`）
+#   而不是 548 MB 的包 —— **HTTP 200、Content-Type: text/html、
+#   Content-Length 对得上**，所以"空响应"与"长度不符"两道都放行。
+#   浏览器能过是因为它会执行那段 JS 拿到 cookie，脚本过不去。
+# ★ 这不是绕过什么鉴权：那是个公开文件（通达信客户端自己就在下它），
+#   只是把请求的样子改成正常浏览器，不解挑战、不伪造 cookie。
+# ⚠ **没法在本机验证它管不管用** —— 我这边从来没被挑战过（同一个 URL
+#   用 curl/8 照样拿到 550.8 MB）。所以下面那条【识别挑战并说清楚】
+#   才是真正的兜底：过不去时要让人一眼看出"这不是你的网络问题"。
+UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36')
+
+
 def _download(url, dst, expect=None, is_zip=False):
     """带进度的下载。★ 先写 .part 再 rename —— 中断的半个文件不许占正名，
     否则下次跑会把半个 zip 当成"已经下好了"。"""
     tmp = dst + '.part'
-    req = urllib.request.Request(url, headers={'User-Agent': 'curl/8'})
+    req = urllib.request.Request(url, headers={
+        'User-Agent': UA,
+        'Accept': 'application/zip,application/octet-stream,*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9'})
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=60) as r:
         total = int(r.headers.get('Content-Length') or 0)
@@ -388,6 +406,29 @@ def _check_zip(tmp, url, got, ctype):
     # 能印出来的部分原样给出去 —— 拦截页/登录页的第一行往往直接说了原因
     txt = head.decode('utf-8', 'replace').replace('\r', ' ').replace('\n', ' ')
     txt = ' '.join(txt.split())[:200]
+    # 🔴🔴 **反爬 JS 校验要单独认出来** —— 它与"公司网络拦截"要做的事
+    #   完全不同，而上一版把两者合成一句「多半是网关/代理的拦截页」，
+    #   把人引到网络上去查了一轮（2026-09-27 真机）。
+    #   指纹：腾讯云 EdgeOne 的 Bot 管理会返回一段混淆 JS，正文里有
+    #   `EO_Bot_Ssid`；更一般地，正文以 `<script` 开头 + 满屏 `_0x`。
+    low = txt.lower()
+    bot = ('eo_bot_ssid' in low or 'edgeone' in low
+           or (low.startswith('<script') and '_0x' in low))
+    if bot:
+        raise SystemExit(
+            '  ✗ 服务端返回的是【反爬虫 JS 校验】，不是日线包\n'
+            '    —— 这不是你的网络问题，是对方 CDN 把脚本挡了\n'
+            '    收到 %.3f MB，Content-Type: %s\n'
+            '    正文开头：%s\n'
+            '    `data.tdx.com.cn` 前面挂着 CDN 的 Bot 管理：浏览器能过'
+            '（它会执行那段 JS 拿 cookie），脚本过不去。\n'
+            '    坏的那份留在 %s（证据，可以删）。\n'
+            '    下一步（任选）：\n'
+            '      · 用浏览器打开 %s 下好，\n'
+            '        存成 %s，再跑一次 —— 已经在那儿的合法 zip 会直接用；\n'
+            '      · 换个网络 / 过一阵再试（Bot 规则常按 IP 信誉判）。'
+            % (got / 1e6, ctype or '(没给)', txt or '(空)', tmp, url,
+               tmp[:-5]))
     raise SystemExit(
         '  ✗ 下回来的不是 zip（开头是 %r，应为 PK\\x03\\x04）\n'
         '    收到 %.3f MB，Content-Type: %s\n'
@@ -398,6 +439,7 @@ def _check_zip(tmp, url, got, ctype):
         '            存成 %s 之后再跑一次（已经在那儿的合法 zip 会直接用）。'
         % (head[:4], got / 1e6, ctype or '(没给)', txt or '(空)',
            tmp, url, tmp[:-5]))
+
 
 
 
