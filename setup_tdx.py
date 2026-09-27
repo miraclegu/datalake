@@ -279,6 +279,65 @@ def _say(*a):
     print(time.strftime('[%m-%d %H:%M:%S]'), *a, flush=True)
 
 
+def _machine_facts(paths):
+    """崩了之后把【这台机器的事实】打出来 —— 别让人手敲一串 PowerShell。
+
+    🔴 `0xc0000006`（STATUS_IN_PAGE_ERROR）最常见的两个来源，光看栈
+      分不出来，而要做的事完全相反：
+
+        分页文件写不下   -> C: 快满 / 分页文件顶到上限（数据不用动）
+        盘读不回来       -> exe 在网络盘、外接盘，或该盘有 I/O 错误
+
+      而这两样都是**可以直接量出来的**，不该靠猜（同「机制是量出来的，
+      不是从代码读出来的」）。
+    ★ 查不到就照实说"查不到"，不编一个数（同「拿不到分红那一格标查不到」）。
+    """
+    out = []
+    if platform.system() != 'Windows':
+        for p in paths:
+            try:
+                u = shutil.disk_usage(p)
+                out.append('    %s  剩 %.1f / %.1f GB'
+                           % (p, u.free / 2 ** 30, u.total / 2 ** 30))
+            except Exception:                               # noqa: BLE001
+                out.append('    %s  查不到' % p)
+        return out
+    # 盘：剩多少、是什么类型（网络/可移动最可疑）
+    for p in paths:
+        try:
+            u = shutil.disk_usage(p)
+            drv = os.path.splitdrive(os.path.abspath(p))[0] or '?'
+            kind = _drive_kind(drv)
+            out.append('    %-3s %-10s 剩 %.1f / %.1f GB   %s'
+                       % (drv, kind, u.free / 2 ** 30, u.total / 2 ** 30, p))
+        except Exception:                                   # noqa: BLE001
+            out.append('    %s  查不到' % p)
+    # 分页文件：峰值顶到上限就是它
+    ps = _pwsh('Get-CimInstance Win32_PageFileUsage | '
+               'ForEach-Object { "$($_.Name) 上限 $($_.AllocatedBaseSize) MB '
+               '当前 $($_.CurrentUsage) MB 峰值 $($_.PeakUsage) MB" }')
+    out.append('    分页文件：%s' % (ps or '查不到（PowerShell 没跑成）'))
+    return out
+
+
+def _drive_kind(drv):
+    n = _pwsh('(Get-CimInstance Win32_LogicalDisk -Filter '
+              '"DeviceID=\'%s\'").DriveType' % drv)
+    return {'2': '可移动盘', '3': '本地盘', '4': '网络盘',
+            '5': '光驱', '6': '内存盘'}.get((n or '').strip(), '类型未知')
+
+
+def _pwsh(script):
+    try:
+        r = subprocess.run(['powershell', '-NoProfile', '-Command', script],
+                           capture_output=True, text=True, timeout=20,
+                           encoding='utf-8', errors='replace')
+        return ' ｜ '.join(x.strip() for x in (r.stdout or '').split('\n')
+                          if x.strip()) or None
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
 def _why_failed(cmd, rc, tail):
     """退出码非 0 —— 到底是它自己崩了，还是正常退出但报了个错？
 
@@ -299,12 +358,16 @@ def _why_failed(cmd, rc, tail):
     sig = sig.group(1).lower() if sig else None
     # Windows 的几个常见异常码 —— 认出来才说得出"该去查什么"
     WHY = {
-        '0xc0000006': ('STATUS_IN_PAGE_ERROR：操作系统读不出这个程序的'
-                       '某一页内存', [
-            '这个 .exe 在网络盘 / 外接盘上？—— 挪到本地盘（比如 C:）再试，'
-            '这是最常见的一种',
-            '杀毒软件拦了 —— Go 编译的程序常被误报，把它所在的目录加白名单',
-            '.exe 下坏了 —— 重装一次：python setup_tdx.py --install --force']),
+        '0xc0000006': ('STATUS_IN_PAGE_ERROR：读不回某一页内存', [
+            '系统盘快满 / 分页文件不够 —— 崩的是映像里的【脏数据页】，'
+            '它的后备存储就是分页文件（默认在 C:）。看下面那行"分页文件"：'
+            '峰值顶到上限，或 C: 剩得少，就是它。'
+            '修法：清出 C: 空间，或把分页文件挪到别的盘 —— 【数据不用动】',
+            '杀毒软件拦了 —— Go 编译的程序常被误报，把 _ingest 目录加白名单',
+            'exe 所在的盘读不回来（网络盘 / 外接盘 / 有 I/O 错误）—— '
+            '看上面那行盘的类型；只把 tdx2db.exe 拷到本地盘跑一次就能分辨，'
+            '数据仍留原地',
+            'exe 下坏了 —— 重装：python setup_tdx.py --install --force']),
         '0xc0000005': ('ACCESS_VIOLATION：程序访问了不该访问的内存', [
             '多半是这个二进制与本机不匹配或已损坏 —— '
             '重装：python setup_tdx.py --install --force']),
@@ -319,6 +382,11 @@ def _why_failed(cmd, rc, tail):
     if steps:
         out.append('    可能的原因，按常见程度排：')
         out += ['      %d) %s' % (i + 1, x) for i, x in enumerate(steps)]
+    facts = _machine_facts([os.path.dirname(cmd[0]) or '.', os.getcwd(),
+                            'C:\\' if platform.system() == 'Windows' else '/'])
+    if facts:
+        out.append('    这台机器现在是这样（判上面哪一条最像）：')
+        out += facts
     out.append('    先自查一下它起不起得来：')
     out.append('      %s version' % cmd[0])
     out.append('    （起得来说明程序本身在，那就多半是上面第 1 / 2 条）')
