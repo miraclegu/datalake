@@ -913,6 +913,7 @@ def bootstrap(allow_shrink=False, keep_zip=False, reuse_vipdoc=False):
                          % os.path.relpath(__file__, REPO))
     os.makedirs(TDX, exist_ok=True)
     zp = os.path.join(TDX, 'hsjday.zip')
+    downloaded = False
     if reuse_vipdoc and os.path.isdir(VIPDOC):
         _say('沿用已有 vipdoc（%d 个文件）' % sum(
             len(f) for _, _, f in os.walk(VIPDOC)))
@@ -926,8 +927,21 @@ def bootstrap(allow_shrink=False, keep_zip=False, reuse_vipdoc=False):
                 #   没有任何地方交代（同「删了要留痕」）。
                 _say('🔴 %s %s —— 删掉重下' % (os.path.basename(zp), why))
                 os.remove(zp)
+            # 🔴 **下之前先说一句**：vipdoc/ 里已经有解好的 .day 的话，
+            #   这 548 MB 根本不用再下一遍 —— 而那条 `--reuse-vipdoc`
+            #   得人自己知道才用得上（同「硬拒必须配一个逃生口，
+            #   而且要把它说出来」）。
+            #   实测真机就卡在这里：手工下好的包解完被删，下一次又去下、
+            #   又被反爬挡住，而 12438 个 .day 好好地躺在 vipdoc/ 里。
+            if os.path.isdir(VIPDOC):
+                _nday = sum(1 for _, _, fs in os.walk(VIPDOC)
+                            for f in fs if f.endswith('.day'))
+                if _nday > 1000:
+                    _say('  ⚠ vipdoc/ 里已经有 %d 个 .day —— 想跳过下载'
+                         '与解包，加 --reuse-vipdoc 再跑一次' % _nday)
             _say('下载全量日线包（约 548 MB）…')
             _download(VIPDOC_URL, zp, is_zip=True)
+            downloaded = True
         # 坏包早失败：解之前先验一次（同上传聚宽包那条）
         _say('校验 zip…')
         with zipfile.ZipFile(zp) as z:
@@ -956,8 +970,20 @@ def bootstrap(allow_shrink=False, keep_zip=False, reuse_vipdoc=False):
                 '\n   python3 -c "import zipfile;'
                 'print(zipfile.ZipFile(%r).namelist()[:3])"' % (
                     days, len(subs), zp))
-        if not keep_zip:
+        # 🔴🔴 **我们下的可以删，人放的不许删。**
+        #   真机 2026-09-27：那个 URL 被 CDN 反爬挡住，用户用浏览器手工下
+        #   了 551 MB 放进来 —— 解包成功之后我们**把它删了**，下一次跑又
+        #   去下、又被挡。删一个自己没创建的文件本来就不对，而这里的代价
+        #   是"再下一次 548 MB"，在那台机器上等于走不通。
+        # ★ 删的时候要说一句（同「删了要留痕」）；留的时候也要说清为什么，
+        #   否则下次有人会以为是忘了清。
+        if not keep_zip and downloaded:
             os.remove(zp)
+            _say('  删掉 %s（是我们下的；要留着下次用就加 --keep-zip）'
+                 % os.path.basename(zp))
+        elif not keep_zip:
+            _say('  留着 %s（%.0f MB）—— 这份不是我们下的，不动它'
+                 % (os.path.basename(zp), os.path.getsize(zp) / 1e6))
 
     before = _db_stats()
     # 🔴 init 到【另一个文件】，对账通过才替换 —— 直接覆盖的话，
