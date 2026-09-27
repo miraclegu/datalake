@@ -73,6 +73,20 @@ def _panel_day(DL=DL):
     return str(r[0])[:10] if r and r[0] else None
 
 
+def _vipdoc_url():
+    """全量日线包的地址 —— **从 `setup_tdx` 取，不在这里再写一遍**。
+
+    两处各写一份的话，哪天上游换了地址，页面上那个「浏览器下载」按钮
+    会指到一个不存在的 URL，**而它不报错**（点了下个 404 回来）。
+    """
+    try:
+        sys.path.insert(0, DL)
+        import setup_tdx as _st                             # noqa: E402
+        return _st.VIPDOC_URL
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
 def stages(DL=DL, ROOT=ROOT):
     """七个阶段，每个带：现在什么状态 / 还缺什么 / 下一步跑什么 / 大概多久。
 
@@ -118,6 +132,18 @@ def stages(DL=DL, ROOT=ROOT):
                % os.path.join(DL, 'raw', 'tdx', 'kline', 'stock_*.parquet')) \
             if _n_files(os.path.join(DL, 'raw', 'tdx', 'kline', 'stock_*.parquet')) else None
         day = str(r[0])[:10] if r and r[0] else '（有库，未导出）'
+    # 🔴🔴 **这一步下不下得来，不在我们手上。** 2026-09-27 真机实测：
+    #   `data.tdx.com.cn` 前面挂着腾讯云 EdgeOne 的 Bot 管理，脚本拿回来
+    #   的是一段混淆 JS（`EO_Bot_Ssid`）而不是 548 MB 的包 ——
+    #   **而同一个 URL、同样的请求，在另一台机器上照样下得到**。
+    #   也就是说差别在出口 IP 信誉 / TLS 指纹这些我们观察不到的东西上，
+    #   靠改 UA 猜不出来（换成浏览器全套头实测毫无区别）。
+    #   ★ 所以给一条**不依赖猜**的路：浏览器自己去下（它会执行那段挑战
+    #     JS，所以一定过得去），下好之后把文件交回来。
+    #   🔴 页面**不许写死**这里的 URL / 文件名 / 接口 —— 清单在服务端
+    #     （同「加一个指标，广场上自动就有」那条）。
+    _zp = os.path.join(TDX, 'hsjday.zip')
+    _have = os.path.isfile(_zp) and os.path.getsize(_zp) > (1 << 20)
     out.append({
         'id': 'bootstrap', 'name': '② 全量日线 tdx.db',
         'why': '一次性下全市场历史日线并建库（约 1.4 GB）。之后每天只做增量。',
@@ -125,6 +151,18 @@ def stages(DL=DL, ROOT=ROOT):
         'detail': ('%.1f GB' % (os.path.getsize(db) / 1e9)) if os.path.isfile(db)
                   else '还没有 —— 要先装好 ①',
         'cmd': [py, os.path.join(DL, 'setup_tdx.py'), '--bootstrap'],
+        'upload': {
+            'url': _vipdoc_url(),
+            'name': 'hsjday.zip',
+            'accept': '.zip',
+            'api': '/api/setup/vipdoc',
+            'dst': _zp,
+            'have': _have,
+            'have_mb': round(os.path.getsize(_zp) / 1e6, 1) if _have else None,
+            'why': ('这一步要下一个 548 MB 的日线包。对方 CDN 会挡掉脚本'
+                    '（不同机器不一样），而浏览器一定下得到 —— '
+                    '下好之后从这里交回来，建库会直接用它、不再重下。'),
+        },
         'eta_min': (30, 60),
         'eta': '约 30~60 分钟（下载为主）'})
 

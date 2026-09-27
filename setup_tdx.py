@@ -201,6 +201,7 @@ import io
 import json
 import os
 import platform
+import collections
 import re
 import shutil
 import subprocess
@@ -278,12 +279,70 @@ def _say(*a):
     print(time.strftime('[%m-%d %H:%M:%S]'), *a, flush=True)
 
 
+def _why_failed(cmd, rc, tail):
+    """退出码非 0 —— 到底是它自己崩了，还是正常退出但报了个错？
+
+    🔴🔴 **两者在屏幕上长得一模一样**（都是一句「✗ 退出码 2」加一堆输出），
+      而要做的事完全不同：前者要去查那个二进制/机器，后者要去查数据。
+      2026-09-27 真机：`tdx2db.exe init` 吐了几十行 Go runtime 栈
+      （`fatal error: fault` / `signal 0xc0000006`），而我们只说了
+      「✗ 退出码 2」—— 人根本看不出那是抓数程序自己挂了
+      （同「报错必须指向真正的原因」）。
+    """
+    txt = '\n'.join(tail)
+    crash = ('fatal error:' in txt or 'panic:' in txt
+             or re.search(r'^goroutine \d+', txt, re.M) is not None)
+    if not crash:
+        return '  ✗ 退出码 %d' % rc
+    who = os.path.basename(cmd[0])
+    sig = re.search(r'\[signal (0x[0-9a-fA-F]+)', txt)
+    sig = sig.group(1).lower() if sig else None
+    # Windows 的几个常见异常码 —— 认出来才说得出"该去查什么"
+    WHY = {
+        '0xc0000006': ('STATUS_IN_PAGE_ERROR：操作系统读不出这个程序的'
+                       '某一页内存', [
+            '这个 .exe 在网络盘 / 外接盘上？—— 挪到本地盘（比如 C:）再试，'
+            '这是最常见的一种',
+            '杀毒软件拦了 —— Go 编译的程序常被误报，把它所在的目录加白名单',
+            '.exe 下坏了 —— 重装一次：python setup_tdx.py --install --force']),
+        '0xc0000005': ('ACCESS_VIOLATION：程序访问了不该访问的内存', [
+            '多半是这个二进制与本机不匹配或已损坏 —— '
+            '重装：python setup_tdx.py --install --force']),
+        '0xc00000fd': ('STACK_OVERFLOW', [
+            '数据量或目录层级异常 —— 把 --dayfiledir 指到的目录贴出来看看']),
+    }
+    d, steps = WHY.get(sig or '', ('', []))
+    out = ['  ✗ %s 自己崩了（退出码 %d）—— 这不是数据的问题，'
+           '也不是这条链的问题' % (who, rc)]
+    if sig:
+        out.append('    信号 %s%s' % (sig, ('：' + d) if d else ''))
+    if steps:
+        out.append('    可能的原因，按常见程度排：')
+        out += ['      %d) %s' % (i + 1, x) for i, x in enumerate(steps)]
+    out.append('    先自查一下它起不起得来：')
+    out.append('      %s version' % cmd[0])
+    out.append('    （起得来说明程序本身在，那就多半是上面第 1 / 2 条）')
+    return '\n'.join(out)
+
+
 def _run(cmd, cwd=None, check=True):
     _say('  $ %s' % ' '.join(cmd))
-    r = subprocess.run(cmd, cwd=cwd)
-    if check and r.returncode != 0:
-        raise SystemExit('  ✗ 退出码 %d' % r.returncode)
-    return r.returncode
+    # 🔴 stderr 要【边看边留】：子进程直接继承终端的话，那几十行 Go
+    #   runtime 栈我们这边一个字都没有，于是判不出"它自己崩了"。
+    #   ★ 仍然逐行打出来 —— init 要跑十几分钟，不能攒到最后才出声
+    #     （同 install.py 的 `_tee`：tee 不是重定向）。
+    tail = collections.deque(maxlen=200)
+    p = subprocess.Popen(cmd, cwd=cwd, stderr=subprocess.PIPE, bufsize=1,
+                         universal_newlines=True, encoding='utf-8',
+                         errors='replace')
+    for ln in p.stderr:
+        sys.stderr.write(ln)
+        sys.stderr.flush()
+        tail.append(ln.rstrip('\n'))
+    rc = p.wait()
+    if check and rc != 0:
+        raise SystemExit(_why_failed(cmd, rc, list(tail)))
+    return rc
 
 
 def _get(url, timeout=30):
