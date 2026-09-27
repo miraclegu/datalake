@@ -82,12 +82,67 @@ TDX_DIR = tdx_dir()
 TDX_DB = tdx_db()
 
 
-def launchd_logs(tag):
-    """定时任务的 stdout/stderr 落点 -> `(out, err)`。
+# ------------------------------------------------------------------ 日志
+#
+# 🔴🔴 **所有日志都在 `finacial/logs/`（两个仓库的同级）。**
+#   用户 2026-09-27：「日志文件现在在什么地方，能不能全部放到 assay、
+#   datalake 同级的目录下，不然每次找日志都很难找。」
+#   改之前是 **7 种散在 4 个目录**：`datalake/_manifest/logs/`、
+#   `datalake/_manifest/sync_logs/`、`datalake/_manifest/`（launchd 那四个）、
+#   `assay/install.log` —— 要查一件事得先猜它属于哪一类。
+#
+#   **每一类各占一个目录**（用户同一轮追加：「每种类型的日志要一个单独的
+#   目录，以便区分」），分法是【这是哪条链】—— 正好对上人问问题的方式：
+#
+#       logs/setup/    setup-<天>.log   全量同步：建本地数据那 7 个阶段
+#       logs/daily/    daily-<天>.log   每日同步：13 步链 + 信号重算（tick）
+#       logs/web/      web-<天>.log     看板 serve.py 日常运行
+#       logs/runs/     <时间戳>.log     某一次跑的**完整**子进程输出
+#       logs/launchd/  sync.out/.err …  定时器自己的 stdout（只能原地截断）
+#       logs/install/  install.log      装机
+#
+#   ★ `web` 是从 `daily` 里**拆出来**的：原来三个来源混在一个文件里，
+#     而「看板报了个错」与「昨晚同步失败了」是两件不同的事。
+#   ★ 文件名仍带类型前缀 —— 拷一份出来单看时还认得出它是谁。
+LOGS = os.path.join(REPO, 'logs')
 
-    🔴 名字的正本在这里，`setup_tdx.py` 生成 plist 时也取它 ——
-      两处各拼一遍的话，改了名字之后**清理的与写入的就不是同一个文件**，
-      于是日志照旧无限涨，**而它不报错**。
+# 🔴 **每一类日志各占一个目录**（用户 2026-09-27 定）：平铺在一个目录里时
+#   `setup-*.log` / `daily-*.log` / `web-*.log` / 那一次跑的明细混在一起，
+#   要找"今天同步说了什么"得先在一堆文件名里挑。
+#   文件名仍带类型前缀（`daily-2026-09-27.log`）—— 拷出来单看时还认得出是谁。
+LOG_KINDS = ('setup', 'daily', 'web')
+
+
+def log_dir(kind):
+    """<repo>/logs/<kind>/ —— 按天切分的那三类。"""
+    return os.path.join(LOGS, kind)
+
+
+# 某一次跑的**完整**子进程输出（数据页「看完整日志」点的就是它）。
+# 主日志只进骨架（每步 / ✅❌ / 失败尾部），合在一起的话 tdx2db init
+# 那几万行进度会把"哪一步失败了"整个淹掉。
+RUNS_LOGS = os.path.join(LOGS, 'runs')
+LAUNCHD_LOGS = os.path.join(LOGS, 'launchd')
+INSTALL_LOG = os.path.join(LOGS, 'install', 'install.log')
+
+
+def launchd_logs(tag):
+    """定时器自己的 stdout/stderr（launchd 的 StandardOutPath / schtasks）。
+
+    🔴 它们由 **launchd 持有 fd**，所以只能**原地截断**、不能改名或删除
+      （见 `logs.trim_by_days`）。
+    """
+    return (os.path.join(LAUNCHD_LOGS, '%s.out' % tag),
+            os.path.join(LAUNCHD_LOGS, '%s.err' % tag))
+
+
+def launchd_logs_legacy(tag):
+    """搬家之前那一对（`datalake/_manifest/launchd-*.{out,err}`）。
+
+    🔴🔴 **不能只改新路径就完事。** plist 里写着**旧路径**，而它要等人
+      重装定时任务才会变 —— 在那之前 launchd 仍然往旧文件写，而按天裁的
+      是新文件：**旧的又开始无限涨，且不报错**（`launchd-sync.out` 当初
+      就是这么长到 1.6 MB 的）。所以裁的时候两边都裁，直到旧的不再变。
     """
     return (os.path.join(MANIFEST, 'launchd-%s.out' % tag),
             os.path.join(MANIFEST, 'launchd-%s.err' % tag))

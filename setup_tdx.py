@@ -272,7 +272,7 @@ def _plat():
 
 
 def _say(*a):
-    # 🔴 每行带时间 —— 这些输出会进 `_manifest/sync_logs/*.log`，
+    # 🔴 每行带时间 —— 这些输出会进 `logs/runs/*.log`，
     #   而"这是什么时候的报错"是事后翻日志时第一个要回答的问题
     #   （用户原话：日志中连时间都没有，我都不知道是什么时候的报错）。
     #   ★ 进度行（`\r  x/y MB`）不走这里 —— 它每秒刷几次，带时间是噪声。
@@ -1619,6 +1619,10 @@ def install_timer(at=None, tick_at=None):
     if not ok:
         raise SystemExit('🔴 配置不合法：%s' % why)
     JOBS = build_jobs(sc)
+    # 🔴 plist 里的 StandardOutPath 指向 logs/launchd/ —— **父目录不存在时
+    #   launchd 写不出日志，而它不报错**：定时照跑，只是那两个文件永远是空的
+    #   （同「判据永远是现在的状态」：日志空着分不出"没跑"还是"没写成"）。
+    os.makedirs(_paths.LAUNCHD_LOGS, exist_ok=True)
     if osname == 'Darwin':
         for label, args, times, tag, what in JOBS:
             p = _launchd_path(label)

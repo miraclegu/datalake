@@ -102,8 +102,10 @@ sys.path.insert(0, _d)
 import console as _console                                  # noqa: E402
 _console.setup()
 from paths import TDX_DIR as TDX, tdx2db_bin, launchd_logs                    # noqa: E402
+import paths as _paths                                                       # noqa: E402
 import logs as _logs                                                          # noqa: E402
-LOGDIR = os.path.join(DL, '_manifest', 'sync_logs')
+# 🔴 不写成模块级常量 —— 那样 `ASSAY_LOG_DIR` 重定向不到它，
+#   自检就会往生产 logs/runs/ 里塞文件（正本见 logs.runs_dir）。
 STATUS = os.path.join(DL, '_manifest', 'sync_status.json')
 PY = sys.executable
 # 🔴 **按【天】保留，不按份数。** 轮询是每 10 分钟一个点位，而"齐了就
@@ -229,9 +231,9 @@ def main():
     #   轮询每 10 分钟一个点位，绝大多数时候走的就是那条提前返回 ——
     #   接在后面的话**最常走的那条路一个字都不落盘**（同上面裁日志那条）。
     # ★ 这里进的是**骨架**（每步开始 / ✅❌ / 失败时的尾部），子进程的完整
-    #   输出仍然直接写 `sync_logs/<时间戳>.log` —— 两者分工别混：
+    #   输出仍然直接写 `logs/runs/<时间戳>.log` —— 两者分工别混：
     #       daily-<天>.log   今天整个系统说了什么（四个来源汇总）
-    #       sync_logs/<ts>   那一次跑的全部细节（数据页点进去看）
+    #       logs/runs/<ts>   那一次跑的全部细节（数据页点进去看）
     # ★ tee 不是重定向：launchd 的 .out 与前台终端照样看得见。
     # 🔴 **接日志与清日志分成两个 try** —— 混在一起的话"清理失败"会报成
     #   "日志没接上"，而日志其实好好地在写（实测第一版就这么报了一轮，
@@ -250,12 +252,16 @@ def main():
     #   点位，绝大多数时候走的就是那条提前返回，而它也会往 launchd 的 .out
     #   里写一行 —— 放到后面的话**最常走的那条路永远裁不到**，日志照旧涨，
     #   而它不报错（同 tick 里「模拟盘推进要排在提前返回之前」那条）。
-    for _p in launchd_logs('sync'):
+    # 🔴 **新旧两对都要裁**：plist 里写的是旧路径，要等人重装定时任务
+    #   才会变 —— 在那之前 launchd 仍往旧文件写，只裁新的等于没裁，
+    #   而旧的又会无限涨（`launchd-sync.out` 当初就这么长到 1.6 MB）。
+    for _p in (launchd_logs('sync') + _paths.launchd_logs_legacy('sync')):
         _logs.trim_by_days(_p, days=KEEP_DAYS)
 
     if a.if_stale and not _if_stale():
         return 0
 
+    LOGDIR = _logs.runs_dir()
     os.makedirs(LOGDIR, exist_ok=True)
     log = os.path.join(LOGDIR, datetime.now().strftime('%Y%m%d-%H%M%S') + '.log')
     r = Runner(log, dry=a.dry, total=N_STEPS, job='sync',

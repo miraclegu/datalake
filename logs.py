@@ -124,7 +124,7 @@ def trim_by_days(path, days=30, keep_min_lines=200, min_bytes=64 * 1024,
 
 
 def prune_dir_by_days(d, pattern='*.log', days=30, keep_min=5, now=None):
-    """目录里按天清（`sync_logs/` 那种"一次跑一份"的）。
+    """目录里按天清（`logs/runs/` 那种"一次跑一份"的）。
 
     ★ `keep_min` 是防**系统时间跳变**把整个目录清空 —— 最近这几份一律留。
     """
@@ -151,8 +151,8 @@ def prune_dir_by_days(d, pattern='*.log', days=30, keep_min=5, now=None):
 #
 # 改之前的四处，形态各不相同，而**两处在 Windows 上根本不存在**：
 #
-#   sync_daily.py     sync_logs/<时间戳>.log   每次跑一份（269 份）
-#   装配 _run_job     sync_logs/setup-*.log    每次跑一份
+#   sync_daily.py     logs/runs/<时间戳>.log   每次跑一份（269 份）
+#   装配 _run_job     logs/runs/setup-*.log    每次跑一份
 #   tick_daily.py     只有 launchd 的 .out     🔴 Windows 上没有
 #   serve.py          **只往终端打**            🔴 窗口一关就没，而它是长跑那个
 #
@@ -164,9 +164,9 @@ def prune_dir_by_days(d, pattern='*.log', days=30, keep_min=5, now=None):
 # ★ 日常那份混着三个来源，所以每行带 `[来源]` —— 不标的话
 #   "这句是谁说的"查不出来，而这个文件存在的理由就是排查。
 
-LOG_DIR = ('_manifest', 'logs')
-KIND_SETUP = 'setup'
-KIND_DAILY = 'daily'
+KIND_SETUP = 'setup'      # 全量同步：建本地数据那 7 个阶段
+KIND_DAILY = 'daily'      # 每日同步：13 步链 + 信号重算
+KIND_WEB = 'web'          # 看板 serve.py 日常运行
 
 # 🔴 **可重定向** —— 守卫与手工验证不许写生产目录（同 `progress.DIR`、
 #   同 `lv.LIVE` / `ASSAY_RUNS` / `ASSAY_INSTALL_LOG` 那套）。
@@ -175,14 +175,45 @@ KIND_DAILY = 'daily'
 DIR = os.environ.get('ASSAY_LOG_DIR') or None
 
 
-def day_dir(root):
-    return DIR or os.path.join(root, *LOG_DIR)
+def day_dir(kind, root=None):
+    """`<repo>/logs/<kind>/` —— **正本在 `paths.log_dir`**（两仓同级）。
+
+    🔴 **每一类各占一个目录**：平铺时三类按天的文件与「那一次跑」的明细
+      混在一起，找"今天同步说了什么"要先在一堆文件名里挑（用户 09-27 定）。
+    🔴 这里不按 `root` 拼 `_manifest/logs` —— 那会让"日志在哪"有两份定义，
+      搬一次家就错一处（同「datalake 根有 12 份解析」那条）。
+      `root` 保留只为不改调用方的签名。
+    ★ `ASSAY_LOG_DIR`（守卫用）**同样分子目录** —— 重定向之后结构不一样的话，
+      守卫验的就不是产品的真结构了。
+    """
+    if DIR:
+        return os.path.join(DIR, kind)
+    import paths as _p                                      # noqa: E402
+    return _p.log_dir(kind)
 
 
-def day_path(kind, root, now=None):
-    """<root>/_manifest/logs/<kind>-YYYY-MM-DD.log"""
+def runs_dir(root=None):
+    """`<repo>/logs/runs/` —— 某一次跑的**完整**子进程输出。
+
+    🔴 与 `day_dir` 走**同一套重定向**（`ASSAY_LOG_DIR`）：写成模块级常量
+      `LOGDIR = paths.RUNS_LOGS` 的话，守卫重定向不到它 —— 于是自检真的
+      往生产 `logs/runs/` 里塞文件，**而那不报错**（同 `ASSAY_RUNS` /
+      `lv.LIVE` / `progress.DIR` 那套）。
+    """
+    if DIR:
+        return os.path.join(DIR, 'runs')
+    import paths as _p                                      # noqa: E402
+    return _p.RUNS_LOGS
+
+
+def day_path(kind, root=None, now=None):
+    """<repo>/logs/<kind>/<kind>-YYYY-MM-DD.log
+
+    ★ 文件名里仍带 kind：拷一份出来单看时还认得出它是谁。
+    """
     t = now or datetime.datetime.now()
-    return os.path.join(day_dir(root), '%s-%s.log' % (kind, t.strftime('%Y-%m-%d')))
+    return os.path.join(day_dir(kind, root),
+                        '%s-%s.log' % (kind, t.strftime('%Y-%m-%d')))
 
 
 class DayLog(object):
@@ -210,18 +241,23 @@ class DayLog(object):
         self._n = 0                # 连着重复了几次
         self._at = ''              # 末次时间
         self._path = None          # 当前在写哪个文件（跨午夜要先结账）
+        self.last_err = None       # 最近一次写失败的原因（见 _emit）
 
     def _emit(self, text, path=None):
         try:
-            d = day_dir(self.root)
+            d = day_dir(self.kind, self.root)
             if not os.path.isdir(d):
                 os.makedirs(d, exist_ok=True)
             with io.open(path or day_path(self.kind, self.root), 'a',
                          encoding='utf-8', errors='replace') as f:
                 f.write(text)
-        except Exception:                                   # noqa: BLE001
+        except Exception as e:                              # noqa: BLE001
             # ★ 写不进去（只读盘 / 没权限）不许把业务搞挂 —— 但也**不能
             #   静默**：调用方看到返回 False 就知道该说一句。
+            # 🔴 **把原因留下来。** 这个 except 曾经把我一处签名笔误
+            #   （`day_dir(self.root)` —— 少传 kind）当成"只读盘"吞掉，
+            #   表现是**日志一个字都没写、而谁都不报错**。
+            self.last_err = '%s: %s' % (type(e).__name__, e)
             return False
         return True
 
@@ -312,13 +348,13 @@ def tee_stdio(kind, root, tag=''):
     return d, restore
 
 
-def prune_day_logs(root, days=30, now=None):
-    """两类都按天清 —— 用户要的"清理超出时间的日志文件"。"""
-    d = day_dir(root)
-    if not os.path.isdir(d):
-        return []
+def prune_day_logs(root=None, days=30, now=None):
+    """三类各按天清 —— 用户要的"清理超出时间的日志文件"。"""
     n = 0
-    for kind in (KIND_SETUP, KIND_DAILY):
+    for kind in (KIND_SETUP, KIND_DAILY, KIND_WEB):
+        d = day_dir(kind, root)
+        if not os.path.isdir(d):
+            continue
         # ★ `prune_dir_by_days` 返回的是**个数**（int），不是清单 ——
         #   第一版我按清单 `+=`，当场 TypeError（被那句"不许静默"抓到）。
         n += prune_dir_by_days(d, '%s-*.log' % kind, days=days,
