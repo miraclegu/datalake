@@ -271,7 +271,11 @@ def _plat():
 
 
 def _say(*a):
-    print(*a, flush=True)
+    # 🔴 每行带时间 —— 这些输出会进 `_manifest/sync_logs/*.log`，
+    #   而"这是什么时候的报错"是事后翻日志时第一个要回答的问题
+    #   （用户原话：日志中连时间都没有，我都不知道是什么时候的报错）。
+    #   ★ 进度行（`\r  x/y MB`）不走这里 —— 它每秒刷几次，带时间是噪声。
+    print(time.strftime('[%m-%d %H:%M:%S]'), *a, flush=True)
 
 
 def _run(cmd, cwd=None, check=True):
@@ -287,6 +291,32 @@ def _get(url, timeout=30):
         'User-Agent': 'curl/8', 'Accept': 'application/vnd.github+json'})
     with urllib.request.urlopen(req, timeout=timeout) as f:
         return f.read()
+
+
+def _zip_ready(p):
+    """这个 zip 能不能当"已经下好了" —— 判据是【它对不对】，不是"在不在"。
+
+    🔴 原来 bootstrap 写的是 `if not os.path.isfile(zp)`，于是**任何一次
+    下载失败留下的残骸都会让它永远跳过下载**：每跑一次报一次
+    `BadZipFile: File is not a zip file`，而那句话指不到真正的原因
+    （"你那个文件是 0 字节的残骸"）。实测真机卡死在这里
+    —— 日志里明明自己打着「已有 hsjday.zip（**0 MB**），跳过下载」。
+
+    ★ 与下面那道 `testzip()` 分工别记反：这道只问"打得开吗"（只读中央
+      目录，很快），用来决定**要不要重下**；那道逐条验 CRC（慢），
+      用来决定**能不能解**。
+    """
+    if not os.path.isfile(p):
+        return False, '还没有'
+    sz = os.path.getsize(p)
+    if sz < (1 << 20):          # 548 MB 的包不可能只有 1 MB
+        return False, '只有 %.1f MB —— 是上次没下完的残骸' % (sz / 1e6)
+    try:
+        with zipfile.ZipFile(p) as z:
+            z.namelist()
+    except Exception as e:                                  # noqa: BLE001
+        return False, '打不开（%s）—— 多半是上次下到一半' % type(e).__name__
+    return True, '%.0f MB' % (sz / 1e6)
 
 
 def _download(url, dst, expect=None):
@@ -311,6 +341,20 @@ def _download(url, dst, expect=None):
                         got / 1e6 / max(time.time() - t0, .1)))
                     sys.stdout.flush()
     sys.stdout.write('\n')
+    # 🔴 **空响应一律当失败** —— 服务端返回 200 + 空 body 时 got 是 0，
+    #   而 rename 上去就成了一个"看着下好了"的 0 字节文件，之后每次跑
+    #   都 BadZipFile（同 realtime「东财限流返回 data:null，当成'这只票
+    #   没数据'会把持仓价悄悄清空」）。
+    if got == 0:
+        os.remove(tmp)
+        raise SystemExit('  ✗ 一个字节都没下到（服务端给了空响应）—— '
+                         '没有落盘，重跑一次即可')
+    # 🔴 Content-Length 给了就必须对得上：**截断比没下更糟**，
+    #   因为半个 zip 照样占着正名。
+    if total and got != total:
+        os.remove(tmp)
+        raise SystemExit('  ✗ 只下到 %.1f/%.1f MB（连接中断）—— '
+                         '没有落盘，重跑一次即可' % (got / 1e6, total / 1e6))
     if expect and os.path.getsize(tmp) != expect:
         os.remove(tmp)
         raise SystemExit('  ✗ 大小不对：期望 %d，实得 %d' % (expect, got))
@@ -665,12 +709,17 @@ def bootstrap(allow_shrink=False, keep_zip=False, reuse_vipdoc=False):
         _say('沿用已有 vipdoc（%d 个文件）' % sum(
             len(f) for _, _, f in os.walk(VIPDOC)))
     else:
-        if not os.path.isfile(zp):
+        ok, why = _zip_ready(zp)
+        if ok:
+            _say('已有 %s（%s），跳过下载' % (os.path.basename(zp), why))
+        else:
+            if os.path.isfile(zp):
+                # ★ 说出来再删：静默重下的话，"为什么又下了一遍 548 MB"
+                #   没有任何地方交代（同「删了要留痕」）。
+                _say('🔴 %s %s —— 删掉重下' % (os.path.basename(zp), why))
+                os.remove(zp)
             _say('下载全量日线包（约 548 MB）…')
             _download(VIPDOC_URL, zp)
-        else:
-            _say('已有 %s（%.0f MB），跳过下载' % (
-                os.path.basename(zp), os.path.getsize(zp) / 1e6))
         # 坏包早失败：解之前先验一次（同上传聚宽包那条）
         _say('校验 zip…')
         with zipfile.ZipFile(zp) as z:
