@@ -225,6 +225,27 @@ def main():
     ap.add_argument('--if-stale', action='store_true', help='数据齐了就秒退')
     a = ap.parse_args()
 
+    # 🔴🔴 **按天汇总的日志要在【最前面】接上，而且在 `--if-stale` 之前。**
+    #   轮询每 10 分钟一个点位，绝大多数时候走的就是那条提前返回 ——
+    #   接在后面的话**最常走的那条路一个字都不落盘**（同上面裁日志那条）。
+    # ★ 这里进的是**骨架**（每步开始 / ✅❌ / 失败时的尾部），子进程的完整
+    #   输出仍然直接写 `sync_logs/<时间戳>.log` —— 两者分工别混：
+    #       daily-<天>.log   今天整个系统说了什么（四个来源汇总）
+    #       sync_logs/<ts>   那一次跑的全部细节（数据页点进去看）
+    # ★ tee 不是重定向：launchd 的 .out 与前台终端照样看得见。
+    # 🔴 **接日志与清日志分成两个 try** —— 混在一起的话"清理失败"会报成
+    #   "日志没接上"，而日志其实好好地在写（实测第一版就这么报了一轮，
+    #   同「报错必须指向真正的原因」）。
+    try:
+        _logs.tee_stdio(_logs.KIND_DAILY, DL, 'sync')
+    except Exception as _e:                                 # noqa: BLE001
+        # 🔴 不许静默：日志没接上时人事后翻不到任何东西，而屏幕上一切正常。
+        print('⚠ 按天日志没接上：%s: %s' % (type(_e).__name__, _e), flush=True)
+    try:
+        _logs.prune_day_logs(DL, days=KEEP_DAYS)
+    except Exception as _e:                                 # noqa: BLE001
+        print('⚠ 按天日志没清：%s: %s' % (type(_e).__name__, _e), flush=True)
+
     # 🔴 **裁日志要排在 `--if-stale` 提前返回【之前】。** 轮询每 10 分钟一个
     #   点位，绝大多数时候走的就是那条提前返回，而它也会往 launchd 的 .out
     #   里写一行 —— 放到后面的话**最常走的那条路永远裁不到**，日志照旧涨，
