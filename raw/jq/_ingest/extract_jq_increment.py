@@ -138,14 +138,26 @@ def grab_indicator():
 #      全量抽取里有这个过滤（见 extract_jq_financials.fetch_year），
 #      增量必须一模一样，否则两部分数据口径不同而**没有任何报错**。
 FIN_YEARS = [2026, 2025]      # 重抽这几个【报告期年份】，顺带捡回重述
+FIN_JOBS = [('income',    finance.STK_INCOME_STATEMENT,     'report_date'),
+            ('balance',   finance.STK_BALANCE_SHEET,        'report_date'),
+            ('cashflow',  finance.STK_CASHFLOW_STATEMENT,   'report_date'),
+            ('indicator', finance.STK_FINANCIAL_INDICATOR,  'end_date')]
 FIN_PAGE = 3000
 
 
 def grab_financials():
     """按报告期年份整年重抽，文件名与全量一致 —— 合并时整文件替换。"""
-    jobs = [('income',   finance.STK_INCOME_STATEMENT,   'report_date'),
-            ('balance',  finance.STK_BALANCE_SHEET,      'report_date'),
-            ('cashflow', finance.STK_CASHFLOW_STATEMENT, 'report_date')]
+    # 🔴🔴 **四张一起抽，少一张就会静默毁掉 pb。** 2026-09-28 实测事故：
+    #   这里原来只有前三张，于是三大报表前进到了 2026 中报（5214 只），
+    #   而 `indicator_YYYY` 还停在 8-24 全量那一版（1592 只）。
+    #   面板取净资产是 `fin_core JOIN fin_ratio ON (code, report_date) **相等**`
+    #   -> 3622 只配不上 -> `equities` 为 NULL -> `pb = totalmv/equities` 为 NULL
+    #   -> froec 的 `base` 里 `pb > 0` 把它们整片剔掉 -> 候选池 3273 塌到 1097
+    #   -> 实盘当晚出了一版【卖 8 买 8】的假信号。全程没有任何报错。
+    # ★ `indicator` 的报告期列是 `end_date` 不是 `report_date`，
+    #   与全量抽取（extract_jq_financials.TABLES）逐字一致 —— 差一点就是
+    #   两部分数据口径不同，而那不报错。
+    jobs = FIN_JOBS
     for name, tbl, dcol in jobs:
         for year in FIN_YEARS:
             lo, hi = '%d-01-01' % year, '%d-12-31' % year
@@ -153,10 +165,23 @@ def grab_financials():
             try:
                 while True:
                     d = getattr(tbl, dcol)
-                    df = finance.run_query(query(tbl).filter(
-                        d >= lo, d <= hi, tbl.id > last_id,
-                        tbl.report_type == 0        # ★ 只要合并报表，与全量一致
-                    ).order_by(tbl.id).limit(FIN_PAGE))
+                    conds = [d >= lo, d <= hi, tbl.id > last_id]
+                    # 🔴 `report_type` **按表判断有没有**，不能写死。
+                    #   2026-09-28 实测：写死 `tbl.report_type == 0` 之后，
+                    #   `STK_FINANCIAL_INDICATOR` 当场抛
+                    #     type object 'STK_FINANCIAL_INDICATOR'
+                    #     has no attribute 'report_type'
+                    #   而它被 except 吞掉 -> 包里少了一整张 indicator ->
+                    #   本地净资产跟不上三大报表 -> froec 的 pb 整片变 NULL。
+                    # ★ 与全量抽取同一条判据（extract_jq_financials 里是
+                    #   `has_rt = 'report_type' in cols`，探测阶段算出来的）。
+                    #   那张表没有 report_type 是**已知事实**，全量脚本的
+                    #   注释里写着：合并/母公司口径靠 load 阶段与 income
+                    #   逐条对账定死，不靠这个过滤。
+                    if hasattr(tbl, 'report_type'):
+                        conds.append(tbl.report_type == 0)   # ★ 只要合并报表
+                    df = finance.run_query(query(tbl).filter(*conds)
+                                           .order_by(tbl.id).limit(FIN_PAGE))
                     if len(df) == 0:
                         break
                     frames.append(df)
@@ -167,7 +192,11 @@ def grab_financials():
                     if n_page > 200:
                         raise RuntimeError('%s %d 分页超 200 页' % (name, year))
             except Exception as e:                              # noqa: BLE001
-                print('  [!] %s_%d 抽取失败: %s' % (name, year, str(e)[:80]))
+                # ★ 记下**完整**报错并留名：`_require()` 打包前会把它亮出来。
+                #   只打一行 80 字的摘要、然后 continue —— 那就是 2026-09-28
+                #   那个缺一整张表的包的由来。
+                _failed['%s_%d' % (name, year)] = repr(e)
+                print('  [!] %s_%d 抽取失败: %r' % (name, year, e))
                 continue
             out = pd.concat(frames, ignore_index=True) if frames else None
             _save('%s_%d' % (name, year), out)
@@ -260,7 +289,50 @@ def _manifest():
 
 
 # ---------------------------------------------------------------- 4 打包
+# 🔴🔴 **抽取失败 / 空结果都不许悄悄打包。** 2026-09-28 连着栽了两次：
+#   ① 这里原本就漏写了 `indicator` —— 三大报表前进到中报而净资产没跟上，
+#      面板 3622 只票的 pb 变 NULL，froec 候选池从 3273 塌到 1097，
+#      实盘出了一版【卖 8 买 8】的假信号，全程零报错。
+#   ② 补上 `indicator` 之后重抽，它**抽取失败**了 —— 而下面那个
+#      `except: continue` 把它吞掉，`pack()` 照样打出一个缺一整张表的包，
+#      `_manifest` 里连提都不提。本地拿到手完全看不出少了什么。
+# ★ 所以打包前要自证：**声明该有什么，少一样就拒绝打包**。
+#   逃生口是 `ALLOW_MISSING` —— 某张表确实没有数据时，在这里显式写下
+#   名字和理由，而不是让它静默消失。
+ALLOW_MISSING = ()          # 例：('indicator_2025',)  # 理由：…
+
+_failed = {}                # name -> 真实报错（不截断）
+
+
+def _require():
+    """打包前的完整性自证：声明该产出的每个文件都要在 `_saved` 里。"""
+    want = ['fundamentals_indicator_q']
+    want += ['%s_%d' % (n, y) for n, _t, _d in FIN_JOBS for y in FIN_YEARS]
+    have = {os.path.basename(p).split('.')[0] for p in _saved}
+    miss = [w for w in want if w not in have and w not in ALLOW_MISSING]
+    if not miss:
+        return True
+    print()
+    print('=' * 70)
+    print('🔴 拒绝打包：该产出的表少了 %d 个' % len(miss))
+    for m in miss:
+        why = _failed.get(m)
+        if why:
+            print('   %-26s 抽取报错：%s' % (m, why))
+        elif _stats.get(m, {}).get('rows') == 0:
+            print('   %-26s 抽到 0 行（空结果一律当失败）' % m)
+        else:
+            print('   %-26s 根本没跑到（检查 jobs 定义）' % m)
+    print()
+    print('   少一整张表的包，本地拿到手【看不出来】 —— 2026-09-28 就是这么')
+    print('   让 froec 出了一版卖 8 买 8 的假信号的。修好再抽，或者在')
+    print('   ALLOW_MISSING 里显式写下名字和理由。')
+    print('=' * 70)
+    return False
+
 def pack():
+    if not _require():
+        raise SystemExit(1)
     mf = _manifest()
     ts = str(datetime.date.today()).replace('-', '')
     tar = os.path.join(OUT, 'jq_increment_%s.tar' % ts)

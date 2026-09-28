@@ -67,6 +67,12 @@ CHECKS = [
      "SELECT max(pub_date) FROM read_parquet('{R}/raw/jq/financials/cashflow.parquet')"),
     ('fin_forcast', '业绩预告 pub_date', 'B',
      "SELECT max(pub_date) FROM read_parquet('{R}/raw/jq/stk_fin_forcast.parquet')"),
+    # 🔴🔴 **年度 indicator 此前完全没被监控** —— 而面板的净资产（pb 的分母）
+    #   正是取自它。2026-09-28 实测：三大报表已到 2026 中报、它还停在 8-24
+    #   抽的那一版，两边报告期一错开，3622 只票的 pb 变 NULL，froec 候选池
+    #   从 3273 塌到 1097，当晚出了一版卖 8 买 8 的假信号 —— 全程零报错。
+    ('fin_indicator_y', '财务指标(年度) pub_date', 'B',
+     "SELECT max(pub_date) FROM read_parquet('{R}/raw/jq/financials/indicator.parquet')"),
 ]
 
 

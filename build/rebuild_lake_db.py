@@ -264,6 +264,36 @@ def verify():
         print('❌ %d 项不一致：' % len(bad))
         for k, e, g in bad:
             print('   %-44s 期望 %s 实际 %s' % (k, e, g))
+        # 🔴 **报错要指得到下一步。** 原来到此为止，屏幕上只有一串
+        #   「期望 X 实际 Y」—— 而这两种情形的处置完全相反：
+        #     · 全是**变大** = 新数据进来了，基线该刷新（正常）
+        #     · 有**变小**或语义类变了 = 数据丢了 / 口径错了，**别刷新，去查**
+        #   2026-09-28 实测：补跑 loader 后 21 项全是变大，而这一步照样
+        #   红着退出，指不到"刷新基线"这件事（看板那个按钮就卡在这里）。
+        # ★ 语义类（macro / pit）按 **key 前缀** 分，不看数值方向 ——
+        #   `macro:*` 的值也是整数，只按"变大"分类的话会建议去刷新基线，
+        #   而 `update_baseline` 对语义类是**明确拒绝**的：指了一条走不通
+        #   的路比不说更糟（构造两种情形实测出来的）。
+        def _is_sem(k):
+            return k.startswith('macro:') or k.startswith('pit:')
+        _num = [(k, e, g) for k, e, g in bad
+                if not _is_sem(k) and isinstance(e, int) and isinstance(g, int)]
+        _grew = [x for x in _num if x[2] > x[1]]
+        _shrank = [x for x in _num if x[2] < x[1]]
+        _sem = [(k, e, g) for k, e, g in bad
+                if _is_sem(k) or not (isinstance(e, int) and isinstance(g, int))]
+        print()
+        if _shrank or _sem:
+            print('🔴 其中有【变小】%d 项、【语义类变了】%d 项 —— 这不是"数据长大了"，'
+                  '**别刷新基线**，先查为什么：' % (len(_shrank), len(_sem)))
+            for k, e, g in (_shrank + _sem):
+                print('     %-42s %s -> %s' % (k, e, g))
+        else:
+            print('✅ %d 项**全是变大** —— 那就是新数据进来了。刷新基线：'
+                  % len(_grew))
+            print('     python3 datalake/build/rebuild_lake_db.py --update-baseline \\')
+            print('         --reason "写清这批数据是什么"')
+            print('   （刷新自带护栏：变小一律拒绝、语义类变了也拒绝，不是橡皮图章）')
         sys.exit(1)
     print('✅ 全部 %d 项与基线一致' % len(base))
 

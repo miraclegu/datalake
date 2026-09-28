@@ -62,6 +62,21 @@ TABLES = (('income', 'report_date'), ('balance', 'report_date'),
 FAILURES = []
 
 
+def loadable_mask(df):
+    """这批行里，哪些**够格进库** -> (mask, 非定期报告数, 非标准代码数)。
+
+    🔴 **正本在这里，核对器也调它。** 2026-09-28 实测：包里有 19 行
+      `pub_date` 到 09-23 而库里停在 08-31，看着像"没导进去"，其实全是
+      新上市公司在**招募说明书 / 预披露公告**里给的中报（7 + 12 行），
+      按定期报告口径本就不该进 —— 其中 `C1541.XSHE` 连正式代码都还不是。
+      核对器要能说出"这 19 行是**筛掉的**不是**丢了**"，就必须用**同一份**
+      判据；各写一份的话，哪天口径改了，核对器会开始说反话。
+    """
+    bad_src = (df['source'] != '定期报告')
+    bad_code = ~df['code'].astype(str).str.match(STD_CODE)
+    return ~(bad_src | bad_code), int(bad_src.sum()), int(bad_code.sum())
+
+
 def check(cond, msg):
     print(('  ✓ ' if cond else '  ✗ ') + msg)
     if not cond:
@@ -93,14 +108,12 @@ def main():
             df = pd.read_csv(f, compression='gzip', low_memory=False,
                              dtype={c: str for c in ID_COLS})
             n_raw += len(df)
-            # 过滤 1: 只要定期报告
-            bad_src = (df['source'] != '定期报告')
-            n_src += int(bad_src.sum())
-            df = df[~bad_src]
-            # 过滤 2: 只要标准 A 股代码
-            bad_code = ~df['code'].astype(str).str.match(STD_CODE)
-            n_code += int(bad_code.sum())
-            df = df[~bad_code]
+            # 过滤 1+2：只要【定期报告】且【标准 A 股代码】——
+            #   判据在 `loadable_mask()`，核对器也调它（别写第二份）。
+            ok, _bs, _bc = loadable_mask(df)
+            n_src += _bs
+            n_code += _bc
+            df = df[ok]
             # 标记 4: 占位公告日
             rd = pd.to_datetime(df[date_col], errors='coerce')
             pb = pd.to_datetime(df['pub_date'], errors='coerce')

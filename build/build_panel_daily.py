@@ -336,11 +336,34 @@ def prepare(con):
     #     「同日披露年报+一季报」那节。去重只属于 ASOF 右表（见下方 _fin3_asof）。
     #     fin_core(定期报告) 的 (code, report_date) 实测唯一（0 个重复组），
     #     所以这里不去重不会让下游 join 扇出。
+    # 🔴🔴 **净资产按【同表 as-of】取，不是报告期严格相等。**
+    #
+    #   2026-09-28 实测事故：增量包补齐了三大报表的 2026 中报（5214 只），
+    #   而 `indicator`（净资产的来源）没抽（取数脚本漏了这张表），还停在
+    #   1592 只。原来这里是 `ON f.code=c.code AND f.report_date=c.report_date`
+    #   —— 3622 只配不上 -> `equities` 为 NULL -> `pb = totalmv/equities`
+    #   为 NULL -> froec 的 `base` 里 `pb > 0` 把它们整片剔掉 -> 候选池
+    #   3273 塌到 1097 -> 当晚出了一版【卖 8 买 8】的假信号，零报错。
+    #
+    # ★ 改成 ASOF（取 `f.report_date <= c.report_date` 里最新的一条）：
+    #   · 两表同步时**行为完全不变** —— 最新的那条就是相等的那条
+    #     （下面有等价性自证：覆盖齐全的报告期上逐行对数）
+    #   · 两表错位时退回**上一期**的净资产，而不是让整只票消失。
+    #     偏差是"净资产晚一期"（季度环比通常几个百分点），
+    #     远小于"这只票根本不参与排序"。
+    # ★ **不换数据源**：净资产仍取 `fin_ratio`（= indicator）。实测
+    #   `indicator.equities_this_year` 与资产表的 `equities_parent_company_owners`
+    #   只有 90.09% 完全相等、2.61% 差超过 10% —— 换源就是换口径，
+    #   而这个策略是聚宽移植，口径一漂结论就不可比（用户原话：策略会塌）。
+    # ★ 没有前视：更早的报告期必然更早公告，as-of 只会往回取。
     con.execute("""
     CREATE OR REPLACE TEMP VIEW _fin AS
-    SELECT c.*, f.roe_parent, f.bps, f.total_assets, f.equities
+    SELECT c.*, f.roe_parent, f.bps, f.total_assets, f.equities,
+           f.report_date AS equities_report_date,
+           (f.report_date IS DISTINCT FROM c.report_date) AS equities_is_stale
     FROM fin_core c
-    LEFT JOIN fin_ratio f ON f.code=c.code AND f.report_date=c.report_date
+    ASOF LEFT JOIN fin_ratio f
+      ON f.code = c.code AND f.report_date <= c.report_date
     """)
     # 累计口径 -> TTM 与同比。年报本身即 TTM；其余用「本期累计 + 上年年报 - 上年同期累计」
     con.execute("""

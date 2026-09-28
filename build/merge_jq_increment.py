@@ -110,13 +110,24 @@ def _count(path):
 
 
 # 合并完该跑哪些 loader（顺序有依赖）
+# 🔴 路径从**仓库根**（/Users/guhao/finacial）算起 —— `--and-load` 与打印给人
+#   手抄的那份清单都在根目录下跑。2026-09-28 实测：这里原来写的是
+#   `build/load_*.py`（相对 datalake/），而下面 `tail` 写的是
+#   `datalake/build/*.py`（相对根）—— **同一份清单里两套基准**。
+#   于是看板「上传财务数据」那个按钮走到第 1 步就死：
+#     can't open file '/Users/guhao/finacial/build/load_jq_financials.py'
+#   打印出来那份也一样：前几条要在 datalake/ 下跑、后四条要在根下跑，
+#   照着抄必然有一半跑不起来。
 LOADERS = [
-    ('fundamentals_indicator_q', 'build/load_jq_indicator_q.py'),
-    ('stk_xr_xd',                'build/load_jq_round3.py'),
-    ('income_2026',              'build/load_jq_financials.py'),
-    ('dim_name_history',         'build/load_jq_dimensions.py'),
-    ('dim_status_change',        'build/load_jq_dimensions.py'),
-    ('share_change',             'build/load_jq_share_change.py'),
+    ('fundamentals_indicator_q', 'datalake/build/load_jq_indicator_q.py'),
+    ('stk_xr_xd',                'datalake/build/load_jq_round3.py'),
+    ('income_2026',              'datalake/build/load_jq_financials.py'),
+    # ★ indicator 与三大报表同一个 loader —— 漏了它，只有 indicator
+    #   变化的那一轮就不会重建 parquet（2026-09-28 事故的同类）
+    ('indicator_2026',           'datalake/build/load_jq_financials.py'),
+    ('dim_name_history',         'datalake/build/load_jq_dimensions.py'),
+    ('dim_status_change',        'datalake/build/load_jq_dimensions.py'),
+    ('share_change',             'datalake/build/load_jq_share_change.py'),
 ]
 
 
@@ -434,7 +445,18 @@ def main():
     #   ⚠ build_panel_daily.py 的 --verify 是"只校验不构建"，与
     #     rebuild_lake_db.py 的"构建后校验"语义相反 —— 所以面板要跑两次
     #     （先不带 --verify 构建，再带 --verify 校验）。别合成一条。
-    tail = [['python3', 'datalake/build/rebuild_lake_db.py', '--verify'],
+    # 🔴🔴 **先刷新基线、再校验** —— 只写 `--verify` 的话这一步【注定失败】。
+    #   基线是写死的绝对行数，而日线每天在长、财务每次导入都在长，所以
+    #   "有新数据"与"基线对不上"是同一件事。2026-09-28 实测：看板的
+    #   「上传财务数据」按钮走的就是这条链，第 6 步当场中断（21 项全是
+    #   增加），后面的面板与 beta 永远跑不到 —— 而它报的是一串
+    #   「期望 X 实际 Y」，指不到"你该刷新基线"这件事。
+    # ★ 刷新不是橡皮图章：`--update-baseline` 自带两道护栏 ——
+    #   行数**变小**一律拒绝（数据丢了正是基线该拦的），
+    #   语义类（macro / pit）变了也拒绝。所以它只放行"长大"。
+    tail = [['python3', 'datalake/build/rebuild_lake_db.py',
+             '--update-baseline', '--reason', '聚宽增量包 --and-load 自动刷新'],
+            ['python3', 'datalake/build/rebuild_lake_db.py', '--verify'],
             ['python3', 'datalake/build/build_panel_daily.py'],
             ['python3', 'datalake/build/build_panel_daily.py', '--verify'],
             ['python3', 'datalake/build/build_beta_daily.py']]
