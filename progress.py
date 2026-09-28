@@ -123,11 +123,21 @@ class Progress(object):
         self._flush()
         return self.d['i']
 
-    def finish_step(self, state='ok'):
+    def finish_step(self, state='ok', note=None):
+        """收一步。`note` 是**这一步为什么失败**的一句话。
+
+        🔴 失败那一步光有名字与 rc 是**答不了"我现在该做什么"**的 ——
+          真机 2026-09-27 那次横条上只有 `rc=1` 加一个日志路径，
+          而原因（`Table with name security_universe does not exist`
+          -> 「要先做 ① 聚宽财务数据」）只写进了日志框，人得自己去翻。
+        ★ 摘要归**调用方**给：能翻成下一步就翻（`_stage_fail_hint`），
+          翻不出就给日志里那行原始异常 —— **不猜**（同「认不出的表名
+          不翻译，硬凑一句比不说更糟」）。
+        """
         t = self.d.get('step_started')
         sec = round(time.time() - t, 1) if t else None
         self.d['done'].append({'name': self.d['step'], 'sec': sec,
-                               'state': state})
+                               'state': state, 'note': note or None})
         self._flush()
 
     def finish(self, rc=0):
@@ -180,7 +190,16 @@ def read(job=None):
         if d.get('state') == 'running' and not _alive(d.get('pid')):
             d['state'] = 'stale'
             d['broke_at'] = d.get('step_started') or d.get('started')
-        d['elapsed'] = round(now - d.get('started', now), 1)
+        # 🔴🔴 **结束了就别再走。** 原来这里无条件拿 `now` 减起点 ——
+        #   于是任务 failed / done / stale 之后，页面上那个「已用」每 2 秒
+        #   涨 2 秒（失败那条按设计要留 24 小时，所以它能涨到 24:00:00）。
+        #   而 `finish()` **早就把 `ended` 写进去了** —— 写了没人读。
+        # ★ `stale`（进程没了）用 `broke_at` = 最后一次写文件的时刻：
+        #   我们并不知道它究竟什么时候死的，这是**能证到的最后一刻**，
+        #   比"一直涨"诚实（页面那句「中断了（停在 X）」说的就是它）。
+        _end = (now if d['state'] == 'running'
+                else (d.get('ended') or d.get('broke_at') or now))
+        d['elapsed'] = round(max(0.0, _end - d.get('started', now)), 1)
         d['step_elapsed'] = (round(now - d['step_started'], 1)
                              if d.get('step_started') and d['state'] == 'running'
                              else None)
@@ -198,6 +217,20 @@ def read(job=None):
         # （宁可条不动，也不要编一个看着在走的假进度）。
         d['step_eta'] = (secs[d['i'] - 1] if d['state'] == 'running'
                          and len(secs) == d.get('total') and d['i'] else None)
+        # 🔴 **失败原因要给两个长度，而不是让前端去切。**
+        #   横条主行是**一行**（`.pgs` 会 ellipsis），而翻出来的那句常有
+        #   130+ 字 —— 整句塞进去等于被截没，而它正是最该看到的东西。
+        #   所以这里派生一个"第一句"：主行放它（已经答得了"我该做什么"），
+        #   完整那句留给展开面板与 title。
+        # ★ 派生放服务端 —— 前端去解析服务端的文案是脆的（换个措辞就切错），
+        #   而这两者是**同一份**的两种长度，不是两份实现。
+        for _x in (d.get('done') or []):
+            _n = _x.get('note')
+            if not _n:
+                continue
+            _i = _n.find('。')
+            _x['note1'] = (_n[:_i + 1] if 0 < _i < len(_n) - 1 else
+                           (_n[:70] + '…' if len(_n) > 70 else _n))
         d['eta_from'] = prof.get('at')      # 基准是哪次跑出来的 —— 说得出处
         # 🔴 **未跑那几步的名字与预计耗时**（展开面板要列出"接下来做什么"）。
         #   来自上一次完整跑的剖面，所以页面必须标「上次」——
