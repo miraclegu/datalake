@@ -75,7 +75,9 @@ load_tdx_kline 覆盖写、panel 按年重建、beta 全量重算。中途失败
 """
 
 import argparse
+import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -107,6 +109,8 @@ import logs as _logs                                                          # 
 # 🔴 不写成模块级常量 —— 那样 `ASSAY_LOG_DIR` 重定向不到它，
 #   自检就会往生产 logs/runs/ 里塞文件（正本见 logs.runs_dir）。
 STATUS = os.path.join(DL, '_manifest', 'sync_status.json')
+# 体检自己写的痕：它跑那一刻库里最新到哪天（见 check_data_anomaly）
+STAMP = os.path.join(DL, '_manifest', 'anomaly_stamp.json')
 PY = sys.executable
 # 🔴 **按【天】保留，不按份数。** 轮询是每 10 分钟一个点位，而"齐了就
 #   秒退不建文件" —— 于是"60 份"在忙的日子只盖得住两三天、闲的日子盖住
@@ -119,6 +123,12 @@ KEEP_DAYS = 30
 #   自相矛盾，**而它不报错**。现在步号由 `Runner` 生成，这里是唯一的真值；
 #   末尾还有一条自证（跑完整了就必须正好 N_STEPS 步）。
 N_STEPS = 13
+
+# 🔴 子进程 rc=0 却在自己的输出里写着失败时，用它把那一行抓出来。
+#   **网撒多宽是量出来的**：拿 305 份历史日志的第 1 步输出跑这个正则，
+#   命中 1 份（正是 2026-09-28 出事那天），误报 0。窄到只匹配
+#   `not a valid zip` 就只防得住这一种坏法。
+SWALLOWED_FAIL = re.compile(r'失败|错误|error|not a valid|panic', re.I)
 
 
 class Runner(object):
@@ -153,7 +163,24 @@ class Runner(object):
         except Exception:                                   # noqa: BLE001
             pass
 
-    def _run(self, name, wd, cmd, soft):
+    def _swallowed(self, off, pat):
+        """这一步**自己的输出**里，有没有它吞掉了的失败。
+
+        只读 `off`（= 刚打完 `$ …` 那行时的文件大小）之后的字节 —— 日志是
+        整条链共用**一个**文件，从头扫会把前面几步的报错算到这一步头上。
+        """
+        try:
+            with open(self.log, encoding='utf-8', errors='replace') as f:
+                f.seek(off)
+                body = f.read()
+        except OSError:
+            return None
+        for ln in body.splitlines():
+            if pat.search(ln):
+                return ln.strip()[:300]
+        return None
+
+    def _run(self, name, wd, cmd, soft, bad_pat=None):
         self.n += 1
         # 🔴 进度里存**裸名字**，`i/total` 只给日志那一行 —— 进度里也带前缀
         #   的话页面上会是「第 3 / 13 步 · 3/13 ETF 价格…」，**同一份信息
@@ -168,6 +195,8 @@ class Runner(object):
             self.ok.append(name + '(dry)')
             return True
         t = time.time()
+        # ★ 记在打完 `$ …` 那行之后 —— 下面只读**这一步自己**写的那段
+        off = os.path.getsize(self.log) if self.log else 0
         try:
             with open(self.log, 'a', encoding='utf-8') as f:
                 rc = subprocess.call(cmd, cwd=wd, stdout=f, stderr=subprocess.STDOUT)
@@ -176,6 +205,26 @@ class Runner(object):
                 f.write('%r\n' % (e,))
             rc = 127
         el = int(time.time() - t)
+        # 🔴🔴 **rc=0 不等于成功。** tdx2db 那个 Go 二进制解压失败时只打一行
+        #   `⚠️ 解压文件 … 失败: zip: not a valid zip file`，接着照样
+        #   `🚀 今日任务执行成功` 并 **exit 0**。2026-09-28 实测：那天日线
+        #   正本包是坏的，我们这层原样记成 `✅ 1/13 … 86s`，于是整条链在
+        #   **缺当天行情**的库上跑完 13 步、还出了信号，汇总写「成功 13
+        #   失败 0」—— 而同一份日志的新鲜度段里明明白白写着「A 腿落后 1 个
+        #   交易日 —— 同步没跑成功」。**失败不许映射成成功。**
+        swal = self._swallowed(off, bad_pat) if (rc == 0 and bad_pat) else None
+        if swal:
+            self.say('❌ %s 失败（%ds）—— 子进程 rc=0，**但它自己说失败了**：'
+                     % (name, el))
+            self.say('     %s' % swal)
+            self.say('   （rc 与输出打架时以输出为准 —— 这一步的活是把日线'
+                     '抓进库，抓不到却报成功，后面 12 步就在旧数据上白跑）')
+            self._tail()
+            self.bad.append(name)
+            if self.pg:
+                self.pg.finish_step('bad', note='子进程 rc=0 但输出里是失败：'
+                                    + swal[:120])
+            return False
         if rc == 0:
             self.say('✅ %s  %ds' % (name, el))
             self.ok.append(name)
@@ -197,11 +246,71 @@ class Runner(object):
             self.pg.finish_step('bad')
         return False
 
-    def run(self, name, wd, cmd):
-        return self._run(name, wd, cmd, soft=False)
+    def run(self, name, wd, cmd, bad_pat=None):
+        return self._run(name, wd, cmd, soft=False, bad_pat=bad_pat)
 
-    def run_soft(self, name, wd, cmd):
-        return self._run(name, wd, cmd, soft=True)
+    def run_soft(self, name, wd, cmd, bad_pat=None):
+        return self._run(name, wd, cmd, soft=True, bad_pat=bad_pat)
+
+
+def _read_json(path):
+    """读一个 JSON，读不到就 None（**不猜**，让调用方自己决定怎么办）。"""
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def _stamp_max():
+    """体检那一刻看到的 `raw_kline_daily` 最新日（体检自己写的痕）。"""
+    d = _read_json(STAMP)
+    return (d or {}).get('max_date')
+
+
+def _status_max():
+    """**现在**的 `raw_kline_daily` 最新日（新鲜度刚写出来的那份）。"""
+    for it in ((_read_json(STATUS) or {}).get('items') or []):
+        if it.get('key') == 'tdx_kline':
+            return it.get('max')
+    return None
+
+
+def _leg_a_lag():
+    """A 腿（行情）落后几个交易日 —— 拿不到就 0（查不出来不拦）。"""
+    return (_read_json(STATUS) or {}).get('leg_a_lag') or 0
+
+
+def run_rc(bad, hold):
+    """这一轮的**结论**：0 = 作数，1 = 不作数。
+
+    🔴 退出码、进度状态、汇总那一行**用同一个判据** —— 三处各写一遍的话，
+      迟早分叉，而分叉的那份看着完全正常（2026-09-28 的病根就是"步骤全绿"
+      与"数据不齐"各说各话，人只看最后那一行）。
+    """
+    return 0 if not (bad or hold) else 1
+
+
+def hold_reasons(a_lag, seen, now_max):
+    """这一轮该不该【不作数】 -> 人话理由清单（空 = 作数）。
+
+    🔴 **13 步都绿 ≠ 这一轮作数。** 2026-09-28 16:10 那轮 13 步全绿、
+      汇总写「成功 13 失败 0」并且**出了信号**，而同一份日志的新鲜度段里
+      白纸黑字写着「A 腿（行情）落后 1 个交易日 —— 同步没跑成功」。
+      自己的输出里已经说了没跑成功，就不许当成功（同第 1 步 rc=0 那条）。
+    🔴 第二条：体检**看到的库**与**现在的库**不是同一个。同一天实测，
+      体检 16:16:45 通过时 `raw_kline_daily` 最新还是 09-24，16:42:24
+      新鲜度读同一张表已经是 09-28 —— 体检是在旧库上通过的。
+    ★ **拿不到就不拦**（`None` / 0 一律放行）：「未知不是缺」，查不出来
+      时硬拦会让整条链在一次读文件失败之后永远出不了信号。
+    """
+    out = []
+    if a_lag:
+        out.append('A 腿（行情）落后 %d 个交易日 —— 同步没跑成功' % a_lag)
+    if seen and now_max and seen != now_max:
+        out.append('体检看到的库最新到 %s，而现在是 %s —— 体检是在【旧库】'
+                   '上通过的，它的结论对不上后面几步吃到的数据' % (seen, now_max))
+    return out
 
 
 def _if_stale():
@@ -274,7 +383,8 @@ def main():
     # ★ 不走 tdx2db/scripts/update.sh 与 full_update.sh：两者都调
     #   scripts/fast_update_indicators.py，而该文件【不存在】，脚本是坏的。
     r.run('tdx2db cron（抓日线+复权因子）', TDX,
-          [tdx2db_bin(), 'cron', '--dburi', 'duckdb://./tdx.db'])
+          [tdx2db_bin(), 'cron', '--dburi', 'duckdb://./tdx.db'],
+          bad_pat=SWALLOWED_FAIL)
     # ★ 这一步【漏一天永久丢失】，所以即使前面失败也要跑：它读的是 tdx.db
     #   的当前状态，与 cron 成没成功无关。
     r.run('PIT 快照（漏一天不可逆）', TDX, [PY, 'daily_snapshot.py'])
@@ -289,7 +399,7 @@ def main():
     since = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
     r.run('更新体检（大批跳变即中止）', TDX,
           [PY, os.path.join('scripts', 'check_data_anomaly.py'),
-           '--db', './tdx.db', '--since', since])
+           '--db', './tdx.db', '--since', since, '--stamp', STAMP])
 
     if not r.bad:
         b = os.path.join('datalake', 'build')
@@ -331,6 +441,15 @@ def main():
                        capture_output=True, text=True)
     r.say((p.stdout + p.stderr).strip())
 
+    # ---- 🔴🔴 两道闸：A 腿落后 / 体检看的不是现在这个库 ----
+    #   判据在 `hold_reasons()`（纯函数，可单独构造）；这里只负责说出来。
+    a_lag = 0 if a.dry else _leg_a_lag()
+    seen, now_max = (None, None) if a.dry else (_stamp_max(), _status_max())
+    hold = hold_reasons(a_lag, seen, now_max)
+    for _h in hold:
+        r.say('')
+        r.say('🔴 ' + _h)
+
     # ---- 触发实盘出信号 ----
     if a.no_live:
         r.say('')
@@ -339,6 +458,10 @@ def main():
         r.say('')
         r.say('⚠ 同步有失败，**不出信号** —— 宁可没有信号，'
               '也不要用半截数据算出来的信号')
+    elif hold:
+        r.say('')
+        r.say('⚠ %s，**不出信号** —— 宁可没有信号，也不要用不齐的数据'
+              '算出来的信号' % hold[0])
     elif not a.dry:
         r.say('')
         r.say('───── 实盘出信号 ─────')
@@ -356,6 +479,12 @@ def main():
     #   "因子面板没更新"看起来一样严重，而它们要做的事完全不同。
     if r.warn:
         r.say(' ⚠️ 研究链失败（不影响出信号）: %s' % ' '.join(r.warn))
+    # 🔴 **13 步都绿 ≠ 这一轮作数。** 2026-09-28 16:10 那轮 13 步全绿，
+    #   而新鲜度同一份日志里写着「A 腿落后 1 个交易日 —— 同步没跑成功」，
+    #   汇总却是「成功 13 失败 0」—— 人只会看最后这一行。
+    if hold:
+        r.say(' 🔴 这一轮【不作数】（13 步本身跑完了，但数据不齐）: %s'
+              % '；'.join(hold))
     r.say(' 日志 %s' % log)
     r.say('=' * 70)
 
@@ -367,11 +496,11 @@ def main():
         r.say(' 🔴 步数自证不通过：跑了 %d 步，而 N_STEPS 写的是 %d'
               % (r.n, N_STEPS))
     if r.pg:
-        r.pg.finish(0 if not r.bad else 1)
+        r.pg.finish(run_rc(r.bad, hold))
 
     # 只保留最近 KEEP_DAYS 天（`keep_min` 防系统时间跳变把目录清空）
     _logs.prune_dir_by_days(LOGDIR, '*.log', days=KEEP_DAYS, keep_min=5)
-    return 0 if not r.bad else 1
+    return run_rc(r.bad, hold)
 
 
 _TICK = """import sys

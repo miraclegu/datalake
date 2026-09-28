@@ -17,7 +17,11 @@
 from __future__ import annotations
 
 import argparse
+import io
+import json
+import os
 import sys
+import time
 
 import duckdb
 
@@ -83,9 +87,37 @@ def check_one_day(con, d: str, args) -> tuple[dict, str, bool]:
     return cnt, "\n".join(lines), halt
 
 
+def write_stamp(path, dates, halted):
+    """把【体检这一刻看到的库】留个痕 —— 体检之后库还会变，而那看不出来。
+
+    🔴 2026-09-28 实测：体检 16:16:45 跑完时 `raw_kline_daily` 最新还是
+      09-24（第 5 步 16:16:48 抽出的 parquet 也是 09-24，两处独立对上），
+      而 16:42:24 新鲜度读**同一张表**已经是 09-28 —— 也就是说
+      **体检"通过"的那个库，和后面 9 步实际吃的库不是同一个**，
+      而屏幕上一个字都看不出来。谁写的没查出来（独立 cron、并发轮询、
+      链条 5~13 步、盘中实时、selftest、人手命令、WAL 滞后、第二个 db
+      文件，八条都逐一排除过）。留痕是为了下次能定位。
+    ★ 只记不判：判在 `sync_daily.py`（那里才拿得到"现在"的值）。
+      写坏了也绝不影响体检本身的结论。
+    """
+    try:
+        d = {'max_date': str(max(dates)) if dates else None,
+             'n_dates': len(dates), 'halted': bool(halted),
+             'at': time.time()}
+        tmp = path + '.tmp'
+        with io.open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:                                      # noqa: BLE001
+        # 留痕坏了不许把体检拖下水，但**要说一句**（静默跳过的话，
+        # "没写"与"根本没跑到这里"在屏幕上一模一样）。
+        print('⚠️ 体检留痕写不出来（%s）：%r' % (path, e))
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="数据更新体检(价/量/额 与历史比对)")
     ap.add_argument("--db", required=True)
+    ap.add_argument("--stamp", default=None,
+                    help="把【体检看到的库最新日】写到这个 JSON")
     ap.add_argument("--date", default=None, help="体检指定日期(默认库中最新交易日)")
     ap.add_argument("--since", default=None, help="体检该日期(不含)之后的所有交易日")
     ap.add_argument("--pct", type=float, default=50.0, help="单日涨跌幅异常阈值%%(默认50)")
@@ -118,6 +150,8 @@ def main(argv=None):
         dates = [str(latest)] if latest else []
 
     if not dates:
+        if args.stamp:
+            write_stamp(args.stamp, [], False)
         print("⚠️ 找不到体检日期, 跳过体检"); return 0
 
     print("=" * 56)
@@ -130,6 +164,8 @@ def main(argv=None):
         print(summary)
         any_halt = any_halt or halt
 
+    if args.stamp:
+        write_stamp(args.stamp, dates, any_halt)
     print("-" * 56)
     if any_halt:
         print("❌ 系统性异常: 价/量/额单日异常标的数超阈值, 疑似整体跳变(单位/编码变更等)。")

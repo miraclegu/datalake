@@ -77,6 +77,7 @@ import duckdb
 
 VIPDOC = 'https://www.tdx.com.cn/products/data/data/vipdoc/%slday.zip'
 MARKETS = ('sh', 'sz')
+MK_NAME = {'sh': '沪市', 'sz': '深市'}
 DIVISOR = 1000.0          # ETF/基金在 .day 里是价格 ×1000
 REC = 32                  # date open high low close amount(f4) volume reserved
 UA = {'User-Agent': 'Mozilla/5.0'}
@@ -345,18 +346,23 @@ def main(argv=None):
         url = VIPDOC % mk
         total, lm = _head(url)
         zd = _zip_day(lm)
-        heads[mk] = (total, lm)
+        heads[mk] = (total, lm, zd)
         _say('  %s  %.0f MB  Last-Modified %s%s'
              % (url.rsplit('/', 1)[-1], total / 1e6, lm,
                 '  -> 最多到 %s' % zd if zd else '  -> 解析不了，跳过预检'))
-        if precheck_lag(zd, db_max):
-            return _lag_stop(db_max, zd, pre=True)
+    # 🔴 **两个市场分开判，而且判完再停** —— 原来是边循环边 return，
+    #   于是"卡在谁身上"这件事丢了：2026-09-28 实测，沪市 shlday.zip 已经
+    #   放出 09-28、深市 szlday.zip 还是 09-25 那版，屏幕上却只剩一个合并
+    #   过的「vipdoc 最新到 2026-09-25」，看不出在等谁、也看不出另一半好了。
+    _lag = [mk for mk in MARKETS if precheck_lag(heads[mk][2], db_max)]
+    if _lag:
+        return _lag_stop(db_max, {m: heads[m][2] for m in MARKETS}, _lag, pre=True)
 
     # ---- 取正本（每个市场一个 Range 请求，成员只解一遍）----
     truth, ref, missing = {}, [], []
     for mk in MARKETS:
         url = VIPDOC % mk
-        total, lm = heads[mk]
+        total, lm, _zd = heads[mk]
         cd = _central_dir(url, total)
         want = [(s + '.day', cd[s + '.day']) for s in etf
                 if s.startswith(mk) and s + '.day' in cd]
@@ -385,8 +391,8 @@ def main(argv=None):
     #   ——「报错必须指向真正的原因」。
     #   ★ 退出码非 0 -> 5~8 跳过 -> 面板不前进 -> `is_stale` 判"该跑"
     #     -> 下一个 10 分钟的点位自动重试，等正本放出来就过了。
-    truth_max = max(d for _s, d in truth)
-    lagging = db_max is not None and int(str(db_max).replace('-', '')) > truth_max
+    mk_max, lag_mks = lag_markets(truth, db_max)
+    lagging = bool(lag_mks)
 
     # ---- 自证①：除数 ----
     if not _verify_divisor(con, ref):
@@ -422,7 +428,7 @@ def main(argv=None):
     if diff == 0:
         if lagging:
             _say('✓ 已核对的那些与正本一致')
-            return _lag_stop(db_max, truth_max)
+            return _lag_stop(db_max, mk_max, lag_mks)
         _say('✓ 已与正本一致，跳过')
         return 0
 
@@ -483,17 +489,63 @@ def main(argv=None):
              % (pct_after, RECOVER_PCT))
         return 1
     if lagging:
-        return _lag_stop(db_max, truth_max)
+        return _lag_stop(db_max, mk_max, lag_mks)
     _say('✅ 完成')
     return 0
 
 
-def _lag_stop(db_max, truth_max, pre=False):
-    t = str(truth_max)
-    t = '%s-%s-%s' % (t[:4], t[4:6], t[6:]) if len(t) == 8 else t
-    _say('⏸ 正本还没放出 %s 的数据（vipdoc 最新到 %s%s）—— 今天那批 ETF 行'
+def lag_markets(truth_keys, db_max):
+    """按市场分别算正本最新到哪天 -> `({市场: 最新日}, [落后的市场])`。
+
+    🔴🔴 **不许把两个市场混在一起取 max。** 原来是
+      `truth_max = max(d for _s, d in truth)` —— 沪市带上了今天、深市没带，
+      它照样判"没落后"，于是**深市那批 ETF 一行都没核对过**，脚本一路
+      报 ✅ 完成。（2026-09-28 查当天那次失败时发现；那天是 HEAD 预检先
+      拦住的，而预检自己写着「是省流量的，不是判据」——判据就是这里。）
+    ★ 某个市场**一行都没取到**也算落后：「空结果一律当失败」。不能因为
+      它不在 `truth` 里就当它不存在（`want` 为空时上面 `continue` 掉了）。
+    """
+    mk_max = {m: 0 for m in MARKETS}
+    for sym, d in truth_keys:
+        mk = sym[:2]
+        if d > mk_max.get(mk, 0):
+            mk_max[mk] = d
+    dbi = int(str(db_max).replace('-', '')) if db_max is not None else 0
+    return mk_max, [m for m in MARKETS if dbi > mk_max[m]]
+
+
+def _lag_stop(db_max, days, lag_mks, pre=False):
+    """正本落后时停下 —— **点名是哪个市场**，并说清另一个到哪天了。
+
+    🔴 原来只收一个合并过的日期，日志里于是是「vipdoc 最新到 2026-09-25」
+      —— 而那天沪市其实已经放出 09-28，在等的只有深市，屏幕上看不出来
+      （同「报错必须指向真正的原因」：指一条走不通的路比不说更糟）。
+    """
+    def _d(x):
+        s = str(x)
+        return ('%s-%s-%s' % (s[:4], s[4:6], s[6:])
+                if len(s) == 8 and s.isdigit() else s)
+
+    def _nm(m):
+        return MK_NAME.get(m, m)
+
+    def _zip(m):
+        return (VIPDOC % m).rsplit('/', 1)[-1]
+
+    bad = '、'.join(
+        '%s %s' % (_zip(m), ('最新到 %s' % _d(days.get(m))) if days.get(m)
+                   else '一行都没取到')
+        for m in lag_mks)
+    _say('⏸ %s正本还没放出 %s 的数据：%s%s —— 今天那批【%s】ETF 行'
          '**没有被核对过**，先不往下走。'
-         % (db_max, t, '，按 Last-Modified 预检' if pre else ''))
+         % ('/'.join(_nm(m) for m in lag_mks), db_max, bad,
+            '，按 Last-Modified 预检' if pre else '',
+            '/'.join(_nm(m) for m in lag_mks)))
+    ok = [m for m in MARKETS if m not in lag_mks]
+    if ok:
+        _say('   （%s已经到位：%s）'
+             % ('/'.join(_nm(m) for m in ok),
+                '、'.join('%s 最新到 %s' % (_zip(m), _d(days.get(m))) for m in ok)))
     _say('   vipdoc 整包实测约 17:25~17:55（北京时）更新；轮询窗口到 20:00，'
          '下一个点位会自动重试。%s' % ('（本轮没下载正本）' if pre else ''))
     return 3
