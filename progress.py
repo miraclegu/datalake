@@ -29,8 +29,17 @@ import time
 import uuid
 
 DL = os.path.dirname(os.path.abspath(__file__))
-DIR = os.path.join(DL, '_manifest', 'progress')
-TIMES = os.path.join(DL, '_manifest', 'step_times.json')
+# 🔴 **根走 env** —— 让 selftest 能整轮重定向，而且【子进程也继承得到】。
+#   模块属性只在本进程有效，而写进度的进程有好几个：sync_daily 是
+#   launchd/网页起的**子进程**、装配的每个阶段也是子进程，它们各自
+#   `import progress`。逐个用例改 `P.DIR` 必然漏，而漏了不报错 ——
+#   2026-09-28 实测：全量跑到一半，生产 `_manifest/progress/setup.json`
+#   被一条 web 用例的假阶段（名字叫 "G1"）覆盖掉了，页面上那条横条
+#   于是显示一个根本不存在的装配任务。
+# ★ 与 `ASSAY_LOG_DIR` / `ASSAY_RUNS` 同一条路子。
+_ROOT = os.environ.get('ASSAY_PROGRESS_DIR') or os.path.join(DL, '_manifest')
+DIR = os.path.join(_ROOT, 'progress')
+TIMES = os.path.join(_ROOT, 'step_times.json')
 
 
 def _atomic(path, obj):
