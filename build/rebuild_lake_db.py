@@ -37,6 +37,17 @@ def remap(sql):
         sql = sql.replace(old, new)
     return sql
 
+
+def replaceable(sql):
+    """把 DDL 里的 CREATE 改成 CREATE OR REPLACE。
+
+    不删库之后第二次跑会撞 "already exists"，而那个报错指不到
+    "本来就该是幂等的"这件事。基线里只有 VIEW 与 MACRO 两种。
+    """
+    return re.sub(r'^\s*CREATE\s+(?!OR\s+REPLACE)(VIEW|MACRO)\b',
+                  lambda m: 'CREATE OR REPLACE ' + m.group(1), sql,
+                  count=1, flags=re.I | re.M)
+
 def main():
     raw = io.open(DDL, encoding='utf-8').read()
     stmts = [s.strip() for s in raw.split(';') if s.strip() and not s.strip().startswith('--\n')]
@@ -48,7 +59,7 @@ def main():
             continue
         body = re.sub(r'--\s*=====.*?=====\s*', '', blk).strip().rstrip(';')
         if body:
-            items.append((m.group(1), m.group(2), remap(body)))
+            items.append((m.group(1), m.group(2), replaceable(remap(body))))
     views  = [(n, s) for k, n, s in items if k == 'VIEW']
     macros = [(n, s) for k, n, s in items if k == 'MACRO']
     print('待建：视图 %d 个，表宏 %d 个' % (len(views), len(macros)))
@@ -64,12 +75,17 @@ def main():
         sys.exit(1)
     print('✅ 无残留旧路径')
 
-    if os.path.exists(TARGET):
-        os.remove(TARGET)
+    # 🔴🔴 **不许删掉整个 lake.db** —— 见 `load_jq_dimensions.py` 里那段。
+    #   这份 DDL 基线（`_backup/pit_rebuild.sql`，2026-08-25）只有 30 个视图，
+    #   而库里实际有 44 个：`fin_quarterly` / `jqfactor_q` / `share_change` /
+    #   `share_unlock` 等 13 个是之后由别的 loader 注册的，**基线里没有**。
+    #   删库重建 = 把那 13 个静默抹掉（assay 的 `feed.py` 读 `jqfactor_q`、
+    #   `stk/ctx.py` 读 `share_unlock`，一读就 CatalogException）。
     con = duckdb.connect(TARGET)
 
     # 基表 _code_map
-    con.execute("CREATE TABLE _code_map AS SELECT * FROM read_parquet('%s')" % CODEMAP)
+    con.execute("CREATE OR REPLACE TABLE _code_map AS SELECT * FROM read_parquet('%s')"
+                % CODEMAP)
     print('  _code_map: %d 行' % con.execute('select count(*) from _code_map').fetchone()[0])
 
     # 视图：反复重试直到无进展（隐式拓扑排序）

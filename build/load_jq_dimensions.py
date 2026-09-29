@@ -132,21 +132,34 @@ def main():
         .to_parquet(os.path.join(L1, 'security_name.parquet'), index=False, compression='zstd')
     print('  security_name: %d 条区间, 覆盖 %d 只' % (len(nh), nh['code'].nunique()))
 
-    # 3) 行业快照 → 生效期区间(只保留申万一级和证监会, 实测覆盖 100%;
-    #    jq_l1 仅 62.76% 早期缺, 不要用)
-    ia = raw['dim_industry_asof'][['code', 'as_of', 'sw_l1_code', 'sw_l1_name',
+    # 3) 行业快照 → 生效期区间（申万一/二/三级 + 证监会，实测覆盖均 100%;
+    #    jq_l1 仅 62.76% 早期缺, 不要用）
+    ia = raw['dim_industry_asof'][['code', 'as_of',
+                                   'sw_l1_code', 'sw_l1_name',
+                                   'sw_l2_code', 'sw_l2_name',
+                                   'sw_l3_code', 'sw_l3_name',
                                    'zjw_code', 'zjw_name']].copy()
     ia = ia.sort_values(['code', 'as_of'])
-    # 只在归属发生变化时开新区间(相邻相同则合并)
-    ia['prev'] = ia.groupby('code')['sw_l1_code'].shift(1)
-    ia['is_change'] = (ia['sw_l1_code'] != ia['prev'])
+    # 🔴🔴 **判"有没有变"必须把三级拼起来**，不能只看一级。
+    #   只看 `sw_l1_code` 的话：一级没变、二级/三级变了 -> 不开新区间 ->
+    #   那条区间里的 l2/l3 永远停在**开区间那一刻**的值，此后再不更新，
+    #   而且**不报错**（区间数、覆盖率、面板行数全都正常）。
+    #   实测区间数：只看 l1 = 8737；l1+l2 = 10760；l1+l2+l3 = 12417 ——
+    #   差的那 3680 条正是"一级没变而下级变了"的换挡。
+    # ★ 用 `fillna('')` 而不是直接拼：NaN 参与字符串拼接会整条变 NaN，
+    #   于是 `!=` 恒为真、每个快照都开一条新区间（压缩比从 23 倍掉到 1 倍）。
+    _key = (ia['sw_l1_code'].fillna('').astype(str) + '|'
+            + ia['sw_l2_code'].fillna('').astype(str) + '|'
+            + ia['sw_l3_code'].fillna('').astype(str))
+    ia['is_change'] = (_key != _key.groupby(ia['code']).shift(1))
     seg = ia[ia['is_change']].copy()
     seg['valid_from'] = seg['as_of']
     seg['valid_to'] = seg.groupby('code')['as_of'].shift(-1)
     seg['is_backfilled'] = True    # 季度快照推断出的区间, 非公告驱动 → 显式标记
     to_dates(seg, 'security_industry')[
-        ['code', 'valid_from', 'valid_to', 'sw_l1_code', 'sw_l1_name',
-         'zjw_code', 'zjw_name', 'is_backfilled']] \
+        ['code', 'valid_from', 'valid_to',
+         'sw_l1_code', 'sw_l1_name', 'sw_l2_code', 'sw_l2_name',
+         'sw_l3_code', 'sw_l3_name', 'zjw_code', 'zjw_name', 'is_backfilled']] \
         .to_parquet(os.path.join(L1, 'security_industry.parquet'), index=False, compression='zstd')
     print('  security_industry: %d 行快照 → %d 条区间 (压缩 %.1f 倍)' % (
         len(ia), len(seg), len(ia) / max(len(seg), 1)))
@@ -164,16 +177,36 @@ def main():
     print('\n' + '=' * 72)
     print('DuckDB 视图层(不复制数据, 只指向 parquet)')
     print('=' * 72)
-    if os.path.exists(DB):
-        os.remove(DB)
+    # 🔴🔴 **不许删掉整个 lake.db。**（2026-09-29 事故）
+    #
+    #   原来这里 `os.remove(DB)` 再只按 L0/L1 的 parquet 重建 —— 于是
+    #   `fin_income` / `fin_core` / `fin_ratio`（由 `load_jq_financials.py`
+    #   + `build_canonical_views.py` 建，指向 `raw/jq/financials/`）、
+    #   `kline_*` / `adjust_factor`（`load_tdx_kline.py` 建）**整批消失**。
+    #
+    #   实测后果：每日同步第 7 步「面板（本年增量）」报
+    #   `Catalog Error: Table with name fin_core does not exist!` ——
+    #   而那句话指不到"上一个 loader 把库删了"这件事，看着像面板脚本坏了。
+    #   17:30 / 18:00 / 19:10 三轮同步连着失败，面板一整天没更新。
+    #
+    # 🔴 **`rebuild_lake_db.py` 也这么干**（按 2026-08-25 的 DDL 基线重建，
+    #   丢掉之后新增的 13 个视图）—— 两个"删库重建"各自只知道自己那一半，
+    #   谁后跑谁说了算，而**丢了不报错**：库还在、视图少一半。
+    #
+    # ★ 改法：`CREATE OR REPLACE`，只负责自己这一批，谁先谁后都不丢东西。
+    #   实测两套重叠的 9 个视图定义**完全一样**（都是同一个 parquet 的
+    #   `SELECT *`），所以取并集没有歧义。
+    # ★ 代价：某个 parquet 被删掉时，它的视图会**留在库里指向不存在的文件**。
+    #   这比"静默删掉另一半"轻得多，而且 `t_lake_views_union` 钉住了
+    #   "库里的视图集 == 两个正本的并集"，多了少了都报。
     con = duckdb.connect(DB)
     for f in sorted(os.listdir(L0)):
         if f.endswith('.parquet'):
-            con.execute("CREATE VIEW l0_%s AS SELECT * FROM read_parquet('%s')"
+            con.execute("CREATE OR REPLACE VIEW l0_%s AS SELECT * FROM read_parquet('%s')"
                         % (f[:-8], os.path.join(L0, f)))
     for f in sorted(os.listdir(L1)):
         if f.endswith('.parquet'):
-            con.execute("CREATE VIEW %s AS SELECT * FROM read_parquet('%s')"
+            con.execute("CREATE OR REPLACE VIEW %s AS SELECT * FROM read_parquet('%s')"
                         % (f[:-8], os.path.join(L1, f)))
     views = [r[0] for r in con.execute(
         'SELECT view_name FROM duckdb_views() WHERE NOT internal ORDER BY 1').fetchall()]

@@ -774,7 +774,13 @@ def build_year(con, y):
         CASE WHEN f.np_ttm > 0 AND f.np_yoy > 0
              THEN (b.totalmv / f.np_ttm) / (f.np_yoy * 100) END AS peg,
         -- 维度（as-of）
+        -- 行业：申万一/二/三级 + 证监会。三级都取自同一条 as-of 区间，
+        -- 所以口径天然一致（区间是按三级【联合】判变化切的，见
+        -- load_jq_dimensions 里那段注释）。
         i.sw_l1_code, i.sw_l1_name,
+        i.sw_l2_code, i.sw_l2_name,
+        i.sw_l3_code, i.sw_l3_name,
+        i.zjw_code, i.zjw_name,
         CASE WHEN s.public_status IN ({risk}) THEN 1 ELSE 0 END::TINYINT AS is_st,
         nmh.name AS sec_name,   -- 见下：名称必须取自 security_name
         -- 复刻聚宽 filter_st_stock 的【四条】检查，不只是 is_st：
