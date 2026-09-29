@@ -322,6 +322,171 @@ KNOWN_VWAP_BELOW_LOW = {
 }
 
 FAILURES = []
+
+# 🔴🔴 流通/总股本【双键 as-of】的正本 —— 面板与它的自证共用**这一份**。
+#
+#   原来这段 SQL 抄了两份：面板里一份、构建末尾的自证里一份。而自证的注释
+#   自己写着「用 change_date 做基准等于拿 look-ahead 校验 look-ahead，会
+#   双双通过」—— 结果两份带着**同一个** bug，于是真的双双通过了
+#   （2026-09-28 实测，见下）。两处实现必然分叉，何况它们本该互为判据。
+#
+# ## 双键的含义
+#   可见性看 `pub_date`（没公告的不能用），有效性看 `change_date`（没生效的
+#   也不能用）。**两个都要满足**，所以生效日 = `greatest(change_date, pub_date)`。
+#
+#   缺「可见性」会错（300317.XSHE 实证）：
+#     change_date 2015-10-16 转增     pub_date 2015-10-10  流通 16744.3595万
+#     change_date 2015-12-31 定期报告 pub_date 2016-03-31  流通  9317.7268万
+#     2015-12-31 决策时市场只知道 16744.3595万（×24.64 = 41.26亿），
+#     聚宽开 avoid_future_data 给的正是 41.258亿；tdx 给 9317.7268万（-44%）。
+#
+#   缺「有效性」也会错（300980.XSHE，2026-09-28 实测）：
+#     change_date 2026-09-30 转增     pub_date 2026-09-22  流通 13866万
+#     change_date 2026-06-30 定期报告 pub_date 2026-08-29  流通 10001万
+#     转增 9-22 就公告了但 9-30 才生效。原来只按 pub_date 筛可见、再取
+#     change_date 最大 —— 于是 9-28 当天就用上了 9-30 的股本，流通市值
+#     22.98亿 算成 31.86亿（+38.7%），而聚宽给的是 22.98亿。
+#     注释里写着「有效性看 change_date」，**而那一半从来没实现**，
+#     它只被当成了排序键。
+#
+#   小市值策略按流通市值【升序】取最小 N 只，被高估/低估的票会被系统性地
+#   推前或推后 —— 是选择性偏差而非随机噪声，所以这一项必须 PIT 正确。
+#
+# ## 其余两条（原注释保留）
+#   定增【不】立刻增加流通股本，share_change 已严格建模锁定期：
+#     增发新股上市 → 只增 share_total，新股全额进 share_limited
+#     限售股份上市 / 激励股份解禁 → share_total 不变，share_trade_total 才增
+#   恒等式 share_total = share_trade_total + share_limited 每行自洽。
+#
+#   arg_max 取「已生效行中 change_date 最大者」；排序键带 pub_date 破平局，
+#   保证同一 change_date 的后续修订版本只在其 pub_date 之后才生效。
+# ★ 窗口用 RANGE 不用 ROWS：同一生效日的并列行必须**整组**进入窗口，
+#   ROWS 会在并列中间切一刀，取到哪一行取决于物理顺序。
+SHR_ASOF_SQL = """
+    SELECT code, eff_date, float_sh, total_sh FROM (
+      SELECT code, eff_date,
+             arg_max(fs, ord) OVER win AS float_sh,
+             arg_max(ts, ord) OVER win AS total_sh,
+             row_number() OVER (PARTITION BY code, eff_date
+                 ORDER BY change_date DESC, pub_date DESC) AS _rn
+      FROM (
+        SELECT code, change_date, pub_date,
+               -- 🔴 生效日 = 公告日与生效日的【较晚者】：两个条件都满足才能用
+               greatest(change_date, pub_date) AS eff_date,
+               -- ★ 流通【A股】= share_trade_total - B股 - H股。
+               --   share_trade_total 是「全部无限售流通股」，含 B/H。
+               --   聚宽 circulating_market_cap 只算 A 股，实测四例精确吻合：
+               --     600054 黄山旅游 含B 64.602亿 / 扣B 27.770亿 = JQ 27.770亿
+               --     000756 新华制药 含H 61.326亿 / 扣H 41.211亿 = JQ 41.211亿
+               --     002705/300317 无B/H，扣不扣都等于 JQ
+               --   321 个代码有 B/H 股，其中 15.99% 的行 B/H 字段为 NULL ——
+               --   必须【前向结转】，直接 COALESCE(...,0) 会把这些行的流通股
+               --   算大一倍多。只前向不后向：B股发行之前确实没有 B 股，
+               --   后向填充会把未来才存在的 B 股倒推到发行前（look-ahead）。
+               greatest(share_trade_total - bf_b - bf_h, 0) * 1e4 AS fs,
+               share_total * 1e4 AS ts,
+               {'c': change_date, 'p': pub_date} AS ord
+        FROM (
+          SELECT * EXCLUDE (share_trade_total),
+                 -- ★★ 「定期报告」行的 share_trade_total 会【回退】到某个已被
+                 --   解禁事件超越的旧值 —— 源数据问题，实测 603536.XSHG：
+                 --     2018-06-13 限售股份上市  流通 6025.41万
+                 --     2018-06-30 定期报告      流通 4200.00万  <- 回退
+                 --     2018-12-31 定期报告      流通 6025.41万  <- 又回来
+                 --   双键 as-of 按 change_date 取最大，就会在 2018-06~12 期间
+                 --   取到那个错的 4200万，把流通市值算成 3.46 亿（真值 4.97 亿），
+                 --   于是它在「流通市值升序取最小 N 只」里被顶到第 1 名 ——
+                 --   聚宽同期根本没买它。这是 v0b 对标残差的成因之一。
+                 --   规模：全表 7.74% 的行「流通降而总股本未降」，其中 77% 是定期报告。
+                 -- 护栏：定期报告【不得】把流通股压到低于最近一个【事件行】的值。
+                 --   只管定期报告 —— 回购 / 承诺限售 是事件行，仍可正常下调流通股。
+                 -- 🔴 2026-09-28 实测：这条护栏会**误伤真实下降**（001256 / 301062：
+                 --   限售股重新锁定、可转债转股后的结构调整，流通股是真的降了，
+                 --   而聚宽用的正是定期报告的新值）。它的前提「定期报告压低 =
+                 --   源数据回退」不总成立 —— 单独立项查，别在这里顺手改。
+                 CASE WHEN change_reason = '定期报告' AND ev_f IS NOT NULL
+                      THEN greatest(share_trade_total, ev_f)
+                      ELSE share_trade_total END AS share_trade_total
+          FROM (
+            -- 🔴 B/H 的前向结转要有【终止条件】，而且必须**粘滞**。
+            --   2026-09-28 实测 002910.XSHE 庄园牧场：
+            --     2017-10-31 A股上市起 share_h = 3513（H 股真实存在）
+            --     2022-08-30 股份回购  总 23238->19758、流通 20619->17139
+            --                          两边都降约 3480 ≈ H 的 3513 -> H 已注销
+            --     此后 14 行 share_h 全是 NULL（跨四年）
+            --   原来无条件前向结转，于是 2022-08 之后一直多扣 3513：
+            --   我们算 13626 万股，而 tdx 与聚宽都给 17105/17110 万（差 20.4%）。
+            --   `NULL` 在这里的意思是「**不再有**」，不是「不知道」—— 而
+            --   另外那 15.99% 的 NULL 确实是「不知道」（不结转会把流通算大
+            --   一倍多），所以不能一刀切不结转，必须能分开这两种。
+            -- ★ 判据是**可在当时观察到的**：流通股按 B/H 的量级掉下去了，
+            --   说明它已从流通里移除。不用「后面还有没有显式值」那种判据 ——
+            --   那是前视。
+            -- ★ 粘滞：一旦判定移除，此后一直不结转，**直到出现新的显式值**
+            --   （重新发行 B/H）才重置。第一版只把发生下降的那一行置 0，
+            --   下一行又从"最后一个显式值"结转回来，等于没改（实测）。
+            SELECT * EXCLUDE (b_gone, h_gone),
+                   CASE WHEN share_b IS NOT NULL THEN share_b
+                        WHEN b_gone > 0 THEN 0 ELSE COALESCE(ff_b, 0) END AS bf_b,
+                   CASE WHEN share_h IS NOT NULL THEN share_h
+                        WHEN h_gone > 0 THEN 0 ELSE COALESCE(ff_h, 0) END AS bf_h,
+                   last_value(CASE WHEN change_reason <> '定期报告'
+                                   THEN share_trade_total END IGNORE NULLS) OVER w AS ev_f
+            FROM (
+              SELECT *,
+                     max(drop_b) OVER (PARTITION BY code, grp_b
+                         ORDER BY change_date, pub_date
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS b_gone,
+                     max(drop_h) OVER (PARTITION BY code, grp_h
+                         ORDER BY change_date, pub_date
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS h_gone
+              FROM (
+                SELECT *,
+                       -- 「自最后一个显式值以来」的分组：显式值一出现就翻篇
+                       sum(CASE WHEN share_b IS NOT NULL THEN 1 ELSE 0 END)
+                           OVER w0 AS grp_b,
+                       sum(CASE WHEN share_h IS NOT NULL THEN 1 ELSE 0 END)
+                           OVER w0 AS grp_h,
+                       CASE WHEN share_b IS NULL AND ff_b > 0 AND prev_f IS NOT NULL
+                                 AND share_trade_total <= prev_f - 0.9 * ff_b
+                            THEN 1 ELSE 0 END AS drop_b,
+                       CASE WHEN share_h IS NULL AND ff_h > 0 AND prev_f IS NOT NULL
+                                 AND share_trade_total <= prev_f - 0.9 * ff_h
+                            THEN 1 ELSE 0 END AS drop_h
+                FROM (
+                  SELECT *,
+                         last_value(share_b IGNORE NULLS) OVER w0 AS ff_b,
+                         last_value(share_h IGNORE NULLS) OVER w0 AS ff_h,
+                         last_value(share_trade_total) OVER w1 AS prev_f
+                  FROM read_parquet('{shr}')
+                  WHERE share_trade_total IS NOT NULL AND share_trade_total > 0
+                    AND pub_date IS NOT NULL AND change_date IS NOT NULL
+                  WINDOW w0 AS (PARTITION BY code ORDER BY change_date, pub_date
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                         w1 AS (PARTITION BY code ORDER BY change_date, pub_date
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+                )
+                WINDOW w0 AS (PARTITION BY code ORDER BY change_date, pub_date
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+              )
+            )
+            WINDOW w AS (PARTITION BY code ORDER BY change_date, pub_date
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+          )
+        )
+      )
+      WINDOW win AS (PARTITION BY code ORDER BY eff_date
+          RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+    ) WHERE _rn = 1
+"""
+
+
+def shr_asof_sql(root):
+    """把正本里的 `{shr}` 占位换成真实路径。**不许再抄一份**。"""
+    import os as _os
+    return SHR_ASOF_SQL.replace(
+        '{shr}', _os.path.join(root, 'std', 'share_change.parquet'))
+
 def check(cond, msg):
     print(('  ✓ ' if cond else '  ✗ ') + msg)
     if not cond:
@@ -442,82 +607,7 @@ def prepare(con):
     ) WHERE report_date = _max_rd
     """ % os.path.join(ROOT, 'std', 'fin_indicator_q.parquet'))
 
-    con.execute("""
-    CREATE OR REPLACE TEMP VIEW _shr AS
-    -- ★★ 流通股本的【双键 as-of】：可见性看 pub_date，有效性看 change_date。
-    --   缺一个键就错：tdx 的 floatmv 等价于只看 change_date，于是在 2015-12-31
-    --   就用上了 2016-03-31 才披露的年报口径 —— 这是 look-ahead，不是数据错。
-    --   实证 300317.XSHE：
-    --     change_date 2015-10-16 转增     pub_date 2015-10-10  流通 16744.3595万
-    --     change_date 2015-12-31 定期报告 pub_date 2016-03-31  流通  9317.7268万
-    --   2015-12-31 决策时市场只能知道 16744.3595万（×24.64 = 41.26亿），
-    --   聚宽开了 avoid_future_data 给的正是 41.258亿；tdx 给 9317.7268万（-44%）。
-    --   小市值策略按流通市值【升序】取最小 N 只，被低估的票被系统性推到前面，
-    --   是选择性偏差而非随机噪声 —— 所以这一项必须 PIT 正确。
-    --
-    --   定增【不】立刻增加流通股本，share_change 已严格建模锁定期：
-    --     增发新股上市 → 只增 share_total，新股全额进 share_limited
-    --     限售股份上市 / 激励股份解禁 → share_total 不变，share_trade_total 才增
-    --   恒等式 share_total = share_trade_total + share_limited 每行自洽。
-    --
-    --   arg_max 取「已可见行中 change_date 最大者」；排序键带 pub_date 破平局，
-    --   保证同一 change_date 的后续修订版本只在其 pub_date 之后才生效。
-    SELECT code, pub_date, float_sh, total_sh FROM (
-      SELECT code, pub_date,
-             arg_max(fs, ord) OVER win AS float_sh,
-             arg_max(ts, ord) OVER win AS total_sh,
-             row_number() OVER (PARTITION BY code, pub_date
-                 ORDER BY change_date DESC) AS _rn
-      FROM (
-        SELECT code, change_date, pub_date,
-               -- ★ 流通【A股】= share_trade_total - B股 - H股。
-               --   share_trade_total 是「全部无限售流通股」，含 B/H。
-               --   聚宽 circulating_market_cap 只算 A 股，实测四例精确吻合：
-               --     600054 黄山旅游 含B 64.602亿 / 扣B 27.770亿 = JQ 27.770亿
-               --     000756 新华制药 含H 61.326亿 / 扣H 41.211亿 = JQ 41.211亿
-               --     002705/300317 无B/H，扣不扣都等于 JQ
-               --   321 个代码有 B/H 股，其中 15.99% 的行 B/H 字段为 NULL ——
-               --   必须【前向结转】，直接 COALESCE(...,0) 会把这些行的流通股
-               --   算大一倍多。只前向不后向：B股发行之前确实没有 B 股，
-               --   后向填充会把未来才存在的 B 股倒推到发行前（look-ahead）。
-               greatest(share_trade_total - bf_b - bf_h, 0) * 1e4 AS fs,
-               share_total * 1e4 AS ts,
-               {'c': change_date, 'p': pub_date} AS ord
-        FROM (
-          SELECT * EXCLUDE (share_trade_total),
-                 -- ★★ 「定期报告」行的 share_trade_total 会【回退】到某个已被
-                 --   解禁事件超越的旧值 —— 源数据问题，实测 603536.XSHG：
-                 --     2018-06-13 限售股份上市  流通 6025.41万
-                 --     2018-06-30 定期报告      流通 4200.00万  <- 回退
-                 --     2018-12-31 定期报告      流通 6025.41万  <- 又回来
-                 --   双键 as-of 按 change_date 取最大，就会在 2018-06~12 期间
-                 --   取到那个错的 4200万，把流通市值算成 3.46 亿（真值 4.97 亿），
-                 --   于是它在「流通市值升序取最小 N 只」里被顶到第 1 名 ——
-                 --   聚宽同期根本没买它。这是 v0b 对标残差的成因之一。
-                 --   规模：全表 7.74% 的行「流通降而总股本未降」，其中 77% 是定期报告。
-                 -- 护栏：定期报告【不得】把流通股压到低于最近一个【事件行】的值。
-                 --   只管定期报告 —— 回购 / 承诺限售 是事件行，仍可正常下调流通股。
-                 CASE WHEN change_reason = '定期报告' AND ev_f IS NOT NULL
-                      THEN greatest(share_trade_total, ev_f)
-                      ELSE share_trade_total END AS share_trade_total
-          FROM (
-            SELECT *,
-                   COALESCE(share_b, last_value(share_b IGNORE NULLS) OVER w, 0) AS bf_b,
-                   COALESCE(share_h, last_value(share_h IGNORE NULLS) OVER w, 0) AS bf_h,
-                   last_value(CASE WHEN change_reason <> '定期报告'
-                                   THEN share_trade_total END IGNORE NULLS) OVER w AS ev_f
-            FROM read_parquet('{shr}')
-            WHERE share_trade_total IS NOT NULL AND share_trade_total > 0
-              AND pub_date IS NOT NULL
-            WINDOW w AS (PARTITION BY code ORDER BY change_date, pub_date
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
-          )
-        )
-      )
-      WINDOW win AS (PARTITION BY code ORDER BY pub_date
-          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
-    ) WHERE _rn = 1
-    """.replace('{shr}', os.path.join(ROOT, 'std', 'share_change.parquet')))
+    con.execute("CREATE OR REPLACE TEMP VIEW _shr AS " + shr_asof_sql(ROOT))
 
     # ASOF 专用右表：键必须唯一，否则整个面板构建不确定（实测跨度 1.8pp）。
     # 只在这里去重 —— 推导链（np_ttm 需要上年年报）用的是完整的 _fin3。
@@ -719,7 +809,7 @@ def build_year(con, y):
     LEFT JOIN basic_daily b ON b.symbol=c.symbol AND b.date=c.date
     -- 流通股本（双键 as-of：可见性 pub_date + 有效性 change_date）
     --   条件必须是 pub_date，用 change_date 会引入 look-ahead（见 _shr 注释）
-    ASOF LEFT JOIN _shr    sh ON sh.code=c.jq_code AND sh.pub_date <= c.date
+    ASOF LEFT JOIN _shr    sh ON sh.code=c.jq_code AND sh.eff_date <= c.date
     ASOF LEFT JOIN _fin3_asof f ON f.code=c.jq_code AND f.pub_date  <= c.date
     -- 聚宽权威单季指标（eps/roe/扣非），按公告日 as-of，与 _fin3 同样是 PIT
     ASOF LEFT JOIN _ind    ai ON ai.code=c.jq_code AND ai.pub_date <= c.date
@@ -845,38 +935,12 @@ def verify(con):
     #   总股本是对照组：它本来就 99.95% 吻合，若它一起掉说明 join 口径写错了。
     r = con.execute("""
         WITH pit AS (
-          SELECT code, pub_date, float_sh, total_sh FROM (
-            SELECT code, pub_date,
-                   arg_max(fs, ord) OVER win AS float_sh,
-                   arg_max(ts, ord) OVER win AS total_sh,
-                   row_number() OVER (PARTITION BY code, pub_date
-                       ORDER BY change_date DESC) AS _rn
-            FROM (SELECT code, change_date, pub_date,
-                         greatest(share_trade_total - bf_b - bf_h, 0)*1e4 AS fs,
-                         share_total*1e4 AS ts,
-                         {'c': change_date, 'p': pub_date} AS ord
-                  FROM (SELECT * EXCLUDE (share_trade_total),
-                          -- 与面板同一护栏：定期报告不得低于最近事件行（见 _shr 注释）
-                          CASE WHEN change_reason = '定期报告' AND ev_f IS NOT NULL
-                               THEN greatest(share_trade_total, ev_f)
-                               ELSE share_trade_total END AS share_trade_total
-                        FROM (SELECT *,
-                          COALESCE(share_b, last_value(share_b IGNORE NULLS) OVER w, 0) bf_b,
-                          COALESCE(share_h, last_value(share_h IGNORE NULLS) OVER w, 0) bf_h,
-                          last_value(CASE WHEN change_reason <> '定期报告'
-                              THEN share_trade_total END IGNORE NULLS) OVER w AS ev_f
-                        FROM read_parquet('%s')
-                        WHERE share_trade_total > 0 AND pub_date IS NOT NULL
-                        WINDOW w AS (PARTITION BY code ORDER BY change_date, pub_date
-                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))))
-            WINDOW win AS (PARTITION BY code ORDER BY pub_date
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
-          ) WHERE _rn = 1
+""" + shr_asof_sql(ROOT) + """
         ), pn AS (
           SELECT jq_code AS code, date,
                  floatmv/nullif(close_bfq,0) AS mfs,
                  totalmv/nullif(close_bfq,0) AS mts
-          FROM %s
+          FROM {P}
           WHERE close_bfq > 0 AND floatmv > 0 AND date >= DATE '2016-01-01'
         )
         SELECT round(100.0*sum(CASE WHEN abs(pn.mfs/k.float_sh-1)<0.01
@@ -885,8 +949,9 @@ def verify(con):
                                     THEN 1 ELSE 0 END)/count(*), 2),
                round(100.0*sum(CASE WHEN pn.mts IS NULL OR abs(pn.mts/k.total_sh-1)<0.01
                                     THEN 1 ELSE 0 END)/count(*), 2)
-        FROM pn ASOF JOIN pit k ON k.code=pn.code AND k.pub_date<=pn.date
-    """ % (os.path.join(ROOT, 'std', 'share_change.parquet'), P)).fetchone()
+        FROM pn ASOF JOIN pit k ON k.code=pn.code AND k.eff_date<=pn.date
+    """.replace('{P}', P)).fetchone()   # ★ 不用 % 格式化：正本注释里有
+    #   `15.99%` / `7.74%` 这类百分号，会被当成占位符（实测当场 TypeError）
     check(r[0] >= 99.0, '流通股本与股份变动表 PIT 值吻合 %.2f%% >= 99%%' % r[0])
     check(r[1] <= 0.5, '流通股本被低估>10%% 仅 %.2f%%（单向偏差，小市值按升序选股）' % r[1])
     check(r[2] >= 99.0, '总股本吻合 %.2f%% >= 99%%（对照组）' % r[2])
