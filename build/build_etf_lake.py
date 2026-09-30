@@ -161,18 +161,60 @@ def _link_tree(target, link):
         % (link, target, first, (r.stderr or r.stdout).strip()[:120]))
 
 
+def _mount_tdx():
+    """把主 lake 的 `raw/tdx` **整棵**挂到 etf_lake —— 不复制、不列清单。
+
+    🔴🔴 **原来只挂了 `raw/tdx/kline` 一个子目录**，于是 assay 从
+      `<root>/raw/tdx/` 读的另外三样在 etf_lake 下**根本不存在**：
+
+      | 读它的地方 | 路径 |
+      |---|---|
+      | `paths.tdx_factor_sql` -> `symbols.alt_panel` | `adjust_factor.parquet` |
+      | `paths.tdx_gbbq_sql` -> `lv/corp.py` | `gbbq.parquet` |
+      | `symbols.name_snap` | `snapshots/manifest.csv` + `symbol_name_*` |
+
+      实测症状：ETF 回测的交易记录里点名称 -> 浮层 **K 线 0 根**，
+      报的是「本地还没有这份数据（…/etf_lake/raw/tdx/adjust_factor.parquet）」
+      —— 那句话指向"数据没建好"，而真相是**这个 lake 从来没挂过它**
+      （同「报错必须指向真正的原因」）。
+
+    ★ **挂整棵，不逐个列。** 照清单挂的话，主 lake 下次多一个文件，
+      这里不会有、而且**不报错** —— 只是 ETF 那条路上悄悄少一样东西
+      （同「断言直接扫目录，不照清单拼」）。
+    ★ 老布局（`raw/tdx/` 是真目录、里面只有一个 `kline` 链接）**就地迁移**；
+      里面要是有别的东西就**响亮拒绝**，不替人删（「删了要留痕」）。
+    """
+    tdx_link = os.path.join(OUT, 'raw', 'tdx')
+    target = os.path.join(ROOT, 'raw', 'tdx')
+    if os.path.islink(tdx_link):
+        return '已挂'
+    if os.path.isdir(tdx_link):
+        left = sorted(os.listdir(tdx_link))
+        if left and left != ['kline']:
+            raise RuntimeError(
+                '%s 是个真目录，里面有 %s —— 它本该整棵挂到 %s。\n'
+                '   这些东西不是 build_etf_lake.py 写的，**不替你删**：'
+                '确认没用之后自己搬走或删掉，再跑一次。'
+                % (tdx_link, '、'.join(left), target))
+        if left == ['kline']:
+            k = os.path.join(tdx_link, 'kline')
+            if not os.path.islink(k):
+                raise RuntimeError(
+                    '%s 是真目录不是链接（可能是复制来的 492 MB）——'
+                    '确认后删掉再跑，这里不替你删。' % k)
+            os.unlink(k)
+        os.rmdir(tdx_link)
+    return _link_tree(target, tdx_link)
+
+
 def main():
-    for d in ('mart/panel_daily', 'std', 'raw/tdx'):
+    for d in ('mart/panel_daily', 'std', 'raw'):
         p = os.path.join(OUT, d)
         if not os.path.isdir(p):
             os.makedirs(p)
-    # 基准指数点位挂到主 lake —— **不复制**（那是 492 MB，而且副本不会
-    # 跟着主 lake 更新）。★ `os.path.exists` 对 Windows 的目录联接也返回
-    # True，所以这个判据在两边都是幂等的。
-    link = os.path.join(OUT, 'raw', 'tdx', 'kline')
-    if not os.path.islink(link) and not os.path.exists(link):
-        how = _link_tree(os.path.join(ROOT, 'raw', 'tdx', 'kline'), link)
-        print('  基准指数目录已挂上（%s）' % how)
+    # tdx 那一棵整个挂到主 lake —— **不复制**（那是 492 MB，而且副本不会
+    # 跟着主 lake 更新）。日线 / 复权因子 / 公司行动 / 名称快照都在里面。
+    print('  raw/tdx 已挂上（%s）' % _mount_tdx())
 
     con = duckdb.connect()
     con.execute("ATTACH '%s' AS tdx (READ_ONLY)" % TDX)
